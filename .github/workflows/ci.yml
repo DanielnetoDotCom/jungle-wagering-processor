@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  quality:
+    name: Quality and unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
+      - run: bun run typecheck
+      - run: bun run check:money
+      - run: bun run build
+      - name: Unit tests, coverage and JUnit report
+        run: |
+          mkdir -p reports
+          bun test --coverage --coverage-reporter=lcov --coverage-dir=coverage \
+            --reporter=junit --reporter-outfile=reports/unit.xml ./test/unit
+      - name: Upload unit results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unit-results
+          path: |
+            reports/
+            coverage/
+          if-no-files-found: warn
+          retention-days: 14
+
+  tests:
+    name: PostgreSQL and SQS (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: integration
+            timeout: 60000
+          - suite: concurrency
+            timeout: 180000
+          - suite: fault-injection
+            timeout: 180000
+          - suite: e2e
+            timeout: 180000
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: wagering
+          POSTGRES_USER: wagering_owner
+          POSTGRES_PASSWORD: ci-owner-password
+          POSTGRES_INITDB_ARGS: --set=max_connections=200
+          TZ: UTC
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U wagering_owner -d wagering"
+          --health-interval 3s --health-timeout 3s --health-retries 30
+      localstack:
+        image: localstack/localstack:4.14.0
+        env:
+          SERVICES: sqs
+          SQS_ENDPOINT_STRATEGY: path
+          LOCALSTACK_HOST: localhost:4566
+          DISABLE_EVENTS: '1'
+        ports: ['4566:4566']
+        options: >-
+          --health-cmd "curl -fsS http://localhost:4566/_localstack/health"
+          --health-interval 3s --health-timeout 3s --health-retries 40
+    env:
+      TZ: UTC
+      LOG_LEVEL: silent
+      TEST_DB_HOST: 127.0.0.1
+      TEST_DB_PORT: '5432'
+      TEST_DB_ADMIN_DATABASE: wagering
+      TEST_DB_ADMIN_USER: wagering_owner
+      TEST_DB_ADMIN_PASSWORD: ci-owner-password
+      AWS_ENDPOINT_URL: http://localhost:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - run: bun install --frozen-lockfile
+      - name: Compile entrypoints for E2E
+        if: matrix.suite == 'e2e'
+        run: bun run build
+      - name: Run real database and broker tests
+        run: |
+          mkdir -p reports
+          bun test --timeout ${{ matrix.timeout }} --reporter=junit \
+            --reporter-outfile=reports/${{ matrix.suite }}.xml ./test/${{ matrix.suite }}
+      - name: Collect service diagnostics on failure
+        if: failure()
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+          LOCALSTACK_CONTAINER: ${{ job.services.localstack.id }}
+        run: |
+          mkdir -p reports
+          docker logs "$POSTGRES_CONTAINER" > reports/postgres.log 2>&1
+          docker logs "$LOCALSTACK_CONTAINER" > reports/localstack.log 2>&1
+      - name: Upload test results and diagnostics
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.suite }}
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 14
+
+  compose:
+    name: Docker Compose smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      COMPOSE_PROJECT_NAME: ci-${{ github.run_id }}-${{ github.run_attempt }}
+      API_PUBLIC_PORT: '18080'
+      CI_BASE_URL: http://127.0.0.1:18080
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.3
+      - name: Build and start the full stack
+        run: docker compose -p "$COMPOSE_PROJECT_NAME" up -d --build --wait --wait-timeout 240
+      - name: Verify nginx, three replicas and financial invariants
+        run: bun scripts/verification/compose-smoke.ts
+      - name: Collect Compose diagnostics
+        if: always()
+        run: |
+          mkdir -p reports
+          docker compose -p "$COMPOSE_PROJECT_NAME" ps --all --format json > reports/compose-ps.json
+          docker compose -p "$COMPOSE_PROJECT_NAME" logs --no-color > reports/compose.log 2>&1
+      - name: Upload Compose results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compose-smoke-results
+          path: reports/
+          retention-days: 14
+      - name: Remove this job's disposable stack
+        if: always()
+        run: docker compose -p "$COMPOSE_PROJECT_NAME" down --volumes --remove-orphans
+
+  publish:
+    name: Publish validated images
+    needs: [quality, tests, compose]
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-images.yml

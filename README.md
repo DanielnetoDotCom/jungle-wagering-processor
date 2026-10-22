@@ -1,8 +1,11 @@
 # Jungle Wagering Processor
 
+[![CI](https://github.com/DanielnetoDotCom/jungle-wagering-processor/actions/workflows/ci.yml/badge.svg)](https://github.com/DanielnetoDotCom/jungle-wagering-processor/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/DanielnetoDotCom/jungle-wagering-processor/actions/workflows/codeql.yml/badge.svg)](https://github.com/DanielnetoDotCom/jungle-wagering-processor/actions/workflows/codeql.yml)
+
 Serviço financeiro distribuído que processa transações de apostas (BET, WIN, LOSS, REFUND, ROLLBACK) recebidas de provedores de jogos por **HTTP** e por **SQS**. O foco é correção financeira sob concorrência, duplicação, entrega fora de ordem e falhas. Solução para o [desafio técnico da Jungle Gaming](https://github.com/junglegaming/backend-challenge).
 
-> **Decisões e justificativas:** [ARCHITECTURE.md](ARCHITECTURE.md) · **Testes:** [docs/TEST_REPORT.md](docs/TEST_REPORT.md) · **Carga:** [docs/LOAD_TEST.md](docs/LOAD_TEST.md)
+> **Decisões e justificativas:** [ARCHITECTURE.md](ARCHITECTURE.md) · **Testes:** [docs/TEST_REPORT.md](docs/TEST_REPORT.md) · **Carga:** [docs/LOAD_TEST.md](docs/LOAD_TEST.md) · **CI/CD:** [docs/CI_CD.md](docs/CI_CD.md)
 
 ## Sumário
 
@@ -53,14 +56,14 @@ Como esta solução garante isso:
 | Mensageria | **AWS SQS** (AWS SDK v3) via **LocalStack 4.14** |
 | Dinheiro | **decimal.js** + `NUMERIC(20,2)` |
 | Validação | **zod 4** (contratos estritos compartilhados entre HTTP e SQS) |
-| Observabilidade | **pino** (JSON), **prom-client**, Prometheus + Grafana (perfil opcional) |
+| Observabilidade | **pino** (JSON), **@prometheus-io/client**, Prometheus + Grafana (perfil opcional) |
 | Infra | Docker (multi-stage, não-root), Docker Compose, **nginx 1.28** |
 
 Os motivos de cada versão estão em [ARCHITECTURE.md §10](ARCHITECTURE.md#10-escolha-de-versões).
 
 ## 3. Arquitetura
 
-**DDD + Hexagonal + Monólito modular + Transactional Inbox/Outbox**: um código, uma imagem, vários processos, um PostgreSQL.
+**DDD + Hexagonal + Monólito modular + Transactional Inbox/Outbox**: um código, vários processos, um PostgreSQL e imagem de migration separada.
 
 ```mermaid
 flowchart LR
@@ -98,7 +101,7 @@ flowchart LR
 ## 5. Subir com Docker Compose
 
 ```bash
-git clone <este-repositório> jungle-wagering-processor
+git clone https://github.com/DanielnetoDotCom/jungle-wagering-processor.git
 cd jungle-wagering-processor
 docker compose up -d --build
 ```
@@ -158,7 +161,7 @@ docker compose --profile tools run --rm toolbox bun run demo
 
 ## 7. Executar os testes
 
-Os testes usam **PostgreSQL e LocalStack reais** (os do Compose). Cada arquivo de teste cria **o seu próprio banco** (migrations reais + login de runtime) e as **suas próprias filas**, então os testes não interferem uns nos outros nem nos dados da aplicação. Pré-requisito: `docker compose up -d --build`.
+As suítes automatizadas usam **PostgreSQL e LocalStack reais**. Cada arquivo cria **seu próprio banco** (migrations reais + login de runtime) e **suas próprias filas**. Isso inclui o E2E, que compila e inicia três APIs, três consumers, dois publishers e um reference worker em processos próprios. O E2E não aceita `E2E_BASE_URL`/`E2E_DB_NAME`, não acessa as filas fixas da aplicação e não executa `PurgeQueue`. Para os testes, basta iniciar `docker compose up -d postgres localstack`. Os scripts `demo` e `test:load` operam sobre o stack configurado e criam dados nele.
 
 ```bash
 # Tudo (unitários + integração + concorrência + falhas):
@@ -169,7 +172,7 @@ docker compose --profile tools run --rm toolbox bun run test:unit          # dom
 docker compose --profile tools run --rm toolbox bun run test:integration   # PostgreSQL + LocalStack reais
 docker compose --profile tools run --rm toolbox bun run test:concurrency   # paralelismo real, 3+ processos
 docker compose --profile tools run --rm toolbox bun run test:fault         # SIGKILL em pontos exatos
-docker compose --profile tools run --rm toolbox bun run test:e2e           # contra o stack (nginx, 3 APIs, workers)
+docker compose --profile tools run --rm toolbox bun run test:e2e           # processos compilados, banco e filas próprios
 docker compose --profile tools run --rm toolbox bun run test:load          # teste de carga (60s)
 
 # Verificação completa: lint + typecheck + check:money + build + testes
@@ -177,6 +180,8 @@ docker compose --profile tools run --rm toolbox bun run verify
 ```
 
 O `toolbox` é a imagem `dev` (código + dependências de desenvolvimento). Use `--build` depois de alterar o código. Resultados e cobertura de cada cenário obrigatório estão em [docs/TEST_REPORT.md](docs/TEST_REPORT.md).
+
+O GitHub Actions executa qualidade, testes unitários com cobertura/JUnit, quatro suítes em jobs independentes com PostgreSQL/SQS reais e um smoke do Compose completo. Após aprovação desses checks, publica as imagens runtime e migrations no GHCR com tags por commit, digest, SBOM e provenance. CodeQL e Dependabot complementam as verificações. Consulte [docs/CI_CD.md](docs/CI_CD.md) para gatilhos, artefatos e reprodução local.
 
 ## 8. Migrations
 
@@ -188,6 +193,7 @@ Migrations versionadas e reversíveis em [`migrations/`](migrations/), classes M
 | `…0200MessagingTables` | `inbox_messages`, `outbox_messages` |
 | `…0300IntegrityTriggers` | imutabilidade, encadeamento do ledger, ledger ↔ saldo, máquina de estados, validação de referências |
 | `…0400ApplicationRole` | papel `wagering_app` de menor privilégio |
+| `…0500FinancialIntegrity` | rejeita valores não finitos, inserções retroativas que quebram o sucessor e divergência entre a cauda do ledger e a wallet |
 
 ```bash
 docker compose run --rm migrations                                          # up + provisionamento (feito pelo `up -d`)
@@ -197,6 +203,8 @@ docker compose --profile tools run --rm toolbox bun run migration:up         # r
 ```
 
 O teste `test/integration/migrations.test.ts` aplica tudo, reverte um passo, reverte **tudo** e reaplica, em PostgreSQL real.
+
+A imagem `runtime` das APIs e workers contém apenas dependências de produção. O job `migrations` usa o target separado `migration-runtime`, que inclui o migrator e carrega as migrations somente nesse processo. A migration `…0500` valida o histórico existente antes de instalar as novas regras e aborta atomicamente se houver corrupção; ela não apaga nem corrige lançamentos. Sua execução exige os locks normais de DDL do PostgreSQL: programe a aplicação em um banco grande. Correções, patches de dependências e validação da auditoria estão em [docs/AUDIT_FIXES.md](docs/AUDIT_FIXES.md).
 
 > Com o stack rodando, `migration:down` reverte a última migration (`…0400`, os grants), e os serviços recebem erro de permissão até o `migration:up`. Para experimentar reversões sem afetar a aplicação, prefira o teste acima, que usa um banco descartável.
 
