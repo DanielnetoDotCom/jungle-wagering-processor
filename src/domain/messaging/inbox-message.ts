@@ -43,14 +43,17 @@ export class InboxMessage {
     public readonly messageId: string,
     public readonly consumerName: string,
     private _payloadHash: string | undefined,
-    public readonly receivedAt: Date,
+    private readonly _receivedAt: Date,
     private _receiveCount: number,
     private _status: InboxStatus,
     private _outcome: InboxOutcome | undefined,
     private _transactionId: string | undefined,
     private _resultCode: string | undefined,
     private _processedAt: Date | undefined,
-  ) {}
+  ) {
+    this._receivedAt = new Date(_receivedAt.getTime());
+    this._processedAt = _processedAt && new Date(_processedAt.getTime());
+  }
 
   static receive(props: ReceiveInboxProps): InboxMessage {
     return new InboxMessage(
@@ -92,7 +95,11 @@ export class InboxMessage {
   }
 
   get processedAt(): Date | undefined {
-    return this._processedAt;
+    return this._processedAt && new Date(this._processedAt.getTime());
+  }
+
+  get receivedAt(): Date {
+    return new Date(this._receivedAt.getTime());
   }
 
   get outcome(): InboxOutcome | undefined {
@@ -135,7 +142,7 @@ export class InboxMessage {
     this._outcome = result.outcome;
     this._transactionId = result.transactionId;
     this._resultCode = result.resultCode;
-    this._processedAt = at;
+    this._processedAt = new Date(at.getTime());
   }
 
   markDeadLettered(errorCode: string, receiveCount: number): void {

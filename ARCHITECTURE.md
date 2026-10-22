@@ -83,7 +83,7 @@ flowchart TB
     subgraph infrastructure[src/infrastructure - adaptadores de saída]
         orm[MikroORM + SQL parametrizado]
         sqs[AWS SDK v3 SQS]
-        obs[pino, prom-client, health]
+        obs[pino, @prometheus-io/client, health]
     end
     boot[src/bootstrap - composition root + módulos Nest]
     http & cons & workers --> uc
@@ -93,7 +93,7 @@ flowchart TB
     boot --> interfaces & workers & infrastructure & application
 ```
 
-As fronteiras são **verificadas pelo lint** (`eslint.config.mjs`, regra `no-restricted-imports`): o domínio não pode importar NestJS, MikroORM, AWS SDK, pino, prom-client nem camadas externas; a aplicação não pode importar adaptadores.
+As fronteiras são **verificadas pelo lint** (`eslint.config.mjs`, regra `no-restricted-imports`): o domínio não pode importar NestJS, MikroORM, AWS SDK, pino, @prometheus-io/client nem camadas externas; a aplicação não pode importar adaptadores.
 
 ---
 
@@ -268,7 +268,7 @@ Nenhuma chamada de rede ao SQS acontece dentro dessa transação. Uma falha em q
 
 **Contexto.** As invariantes centrais (saldo, ledger, idempotência, inbox, outbox) precisam ser confirmadas **atomicamente**.
 
-**Decisão.** Um único deployable com módulos separados por camada e por responsabilidade, implantado como **vários processos** (API, consumidores, workers) sobre o **mesmo PostgreSQL**. Uma imagem, seis entrypoints.
+**Decisão.** Um único código de aplicação com módulos separados por camada e por responsabilidade, implantado como **vários processos** (API, consumidores, workers) sobre o **mesmo PostgreSQL**. Seis entrypoints, com imagem runtime compartilhada pelas APIs/workers e imagem separada para o job de migration.
 
 **Alternativas descartadas.** Microsserviços por entidade (wallet, transaction, ledger): exigiriam transações distribuídas (2PC) ou sagas com compensação para o que hoje é um COMMIT. Isso troca uma garantia forte por consistência eventual exatamente onde ela não é aceitável.
 
@@ -433,7 +433,7 @@ Repetir é **sempre seguro** por causa da idempotência. `retryable: true` indic
 
 ### ADR-014 — Docker e infraestrutura
 
-- **Uma imagem** multi-stage (`infra/docker/Dockerfile`): `deps` (lockfile congelado) → `dev` (toolbox de testes) → `build` (`tsc`) → `prod-deps` → `runtime` (`oven/bun:1.4.3-slim`, usuário **não-root** `bun`, apenas `dist/` + dependências de produção).
+- **Imagens multi-stage** (`infra/docker/Dockerfile`): `deps` (lockfile congelado e patches locais) → `dev` (toolbox de testes) → `build` (`tsc`) → `prod-deps` → `runtime` (`oven/bun:1.4.3-slim`, usuário **não-root** `bun`, apenas `dist/` + dependências de produção). O target `migration-runtime` acrescenta as ferramentas de migration e é usado apenas pelo job owner. O ORM carrega o migrator e a lista de migrations dinamicamente quando `withMigrator=true`; APIs e workers não carregam essas dependências.
 - **API e workers separados.** Cada processo roda um único papel (sem workers escondidos dentro da API), o que permite escalar e dimensionar pools de conexão de forma independente (api 10, consumer 5, outbox 3, reference 3; `max_connections=200`).
 - **Inicialização ordenada.** `postgres` e `localstack` healthy → jobs `migrations` e `queue-bootstrap` (`service_completed_successfully`) → `api`/workers (healthy via `/health/ready`) → `nginx`. `init: true` (sinais corretos), `stop_grace_period: 30s`, `restart: unless-stopped`.
 - **Redes.** `edge` (nginx + api) e `backend` (`internal: true`: banco, broker, workers sem rota externa). Só o nginx publica porta (`8080`, ou `API_PUBLIC_PORT`).
@@ -647,5 +647,5 @@ sequenceDiagram
 | PostgreSQL | 17 (alpine) | estável; nenhum recurso do 18 é necessário |
 | LocalStack | 4.14.0 | **última imagem community que roda sem `LOCALSTACK_AUTH_TOKEN`**; as tags `2026.x` encerram com "License activation failed" (verificado). Configurável via `LOCALSTACK_IMAGE`/`LOCALSTACK_AUTH_TOKEN` |
 | nginx | 1.28 | suporta `server … resolve` no open source (redescoberta de réplicas) |
-| zod 4.6, decimal.js 10.6, pino 10.4, prom-client 15.1, AWS SDK v3 3.1150 | — | versões estáveis fixadas exatamente; `bun.lock` com `--frozen-lockfile` |
+| zod 4.6, decimal.js 10.6, pino 10.4, @prometheus-io/client 0.16, AWS SDK v3 3.1150 | — | versões estáveis fixadas exatamente; `bun.lock` com `--frozen-lockfile` |
 | `ajv` 8.13 (devDependency) | — | corrige o hoisting: o ESLint traz `ajv@6` para a raiz e o `ajv-draft-04` (do `umzug`, usado pelo Migrator) precisa do 8. Afeta só o ambiente de desenvolvimento: a imagem de produção não inclui o ESLint |

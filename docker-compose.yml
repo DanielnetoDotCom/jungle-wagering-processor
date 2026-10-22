@@ -127,6 +127,10 @@ services:
   # One-shot job: versioned migrations (schema owner) + runtime login provisioning.
   migrations:
     <<: *app-service
+    build:
+      <<: *app-build
+      target: migration-runtime
+    image: jungle-wagering-processor:migrations
     command: ['bun', 'dist/src/entrypoints/migrate.js', 'up']
     restart: 'no'
     environment:
@@ -255,8 +259,6 @@ services:
       TEST_DB_ADMIN_USER: ${POSTGRES_OWNER_USER:-wagering_owner}
       TEST_DB_ADMIN_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-local-dev-owner-password}
       TEST_DB_ADMIN_DATABASE: ${POSTGRES_DB:-wagering}
-      E2E_BASE_URL: http://nginx:8080
-      E2E_DB_NAME: ${POSTGRES_DB:-wagering}
     depends_on:
       postgres:
         condition: service_healthy

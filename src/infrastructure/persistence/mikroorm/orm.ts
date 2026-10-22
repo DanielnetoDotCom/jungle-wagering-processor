@@ -1,6 +1,4 @@
-import { Migrator } from '@mikro-orm/migrations';
 import { defineConfig, MikroORM, type Options } from '@mikro-orm/postgresql';
-import { MIGRATIONS } from '../../../../migrations';
 import type { Logger } from '../../../application/ports/runtime.ports';
 import { sleep } from '../../../shared/sleep';
 import type { AppConfig } from '../../configuration/config';
@@ -60,15 +58,6 @@ export function mikroOrmOptions(database: AppConfig['database'], options: OrmOpt
         application_name: options.applicationName,
       },
     },
-    extensions: options.withMigrator ? [Migrator] : [],
-    migrations: {
-      migrationsList: MIGRATIONS,
-      tableName: 'mikro_orm_migrations',
-      transactional: true,
-      allOrNothing: true,
-      snapshot: false,
-      silent: true,
-    },
   });
 }
 
@@ -78,10 +67,28 @@ export function mikroOrmOptions(database: AppConfig['database'], options: OrmOpt
  * of crash-looping.
  */
 export async function initOrm(config: AppConfig, logger: Logger, options: OrmOptions): Promise<MikroORM> {
+  const ormOptions = mikroOrmOptions(config.database, options);
+  if (options.withMigrator) {
+    // Migration tooling is confined to the migration image / developer tools.
+    // API and workers neither load nor ship these CLI dependencies.
+    const [{ Migrator }, { MIGRATIONS }] = await Promise.all([
+      import('@mikro-orm/migrations'),
+      import('../../../../migrations/index.js'),
+    ]);
+    ormOptions.extensions = [Migrator];
+    ormOptions.migrations = {
+      migrationsList: MIGRATIONS,
+      tableName: 'mikro_orm_migrations',
+      transactional: true,
+      allOrNothing: true,
+      snapshot: false,
+      silent: true,
+    };
+  }
   const attempts = config.database.startupRetryAttempts;
   for (let attempt = 1; ; attempt += 1) {
     try {
-      const orm = await MikroORM.init(mikroOrmOptions(config.database, options));
+      const orm = await MikroORM.init(ormOptions);
       if (await orm.isConnected()) {
         return orm;
       }

@@ -1,6 +1,6 @@
 # Relatório de testes
 
-Execução de referência: **22/10/2026**, no container `toolbox` (`docker compose --profile tools run --rm --build toolbox bun run verify`), contra o PostgreSQL 17 e o LocalStack 4.14 do Docker Compose, no mesmo ambiente descrito em [LOAD_TEST.md](LOAD_TEST.md).
+Execução após correções da auditoria: **22/10/2026**, Bun 1.4.3 em container de ferramentas, PostgreSQL 17 e LocalStack 4.14 reais no projeto descartável `jungle-fix-20261022-02`, com redes, volume e tags de imagem próprios. O stack original não foi atualizado nesta etapa. Para reproduzir pelo Compose do repositório: `docker compose --profile tools run --rm --build toolbox bun run verify`. Detalhes das correções, isolamento e limitações em [AUDIT_FIXES.md](AUDIT_FIXES.md).
 
 `bun run verify` executa, em ordem e falhando no primeiro erro: **ESLint** (`--max-warnings=0`, regras com type-checking e fronteiras de camadas) → **Prettier** (`--check`) → **typecheck** (`tsc --noEmit`, modo estrito) → **`check:money`** → **build** (`tsc`) → **testes**.
 
@@ -8,15 +8,15 @@ Execução de referência: **22/10/2026**, no container `toolbox` (`docker compo
 
 | Suíte | Comando | Arquivos | Testes | Resultado | Duração |
 |---|---|---|---|---|---|
-| Unitários (domínio, contratos, hash) | `bun run test:unit` | 8 | 143 | ✅ 143 pass | 0,1 s |
-| Integração (PostgreSQL + LocalStack reais) | `bun run test:integration` | 8 | 86 | ✅ 86 pass | 47,0 s |
-| Concorrência (paralelismo real, processos reais) | `bun run test:concurrency` | 4 | 12 | ✅ 12 pass | 19,7 s |
-| Falhas (SIGKILL em pontos exatos) | `bun run test:fault` | 1 | 4 | ✅ 4 pass | 17,4 s |
-| **Subtotal `bun run test`** | | **21** | **245** | ✅ **245 pass, 0 fail** | |
-| E2E (stack Compose via nginx) | `bun run test:e2e` | 1 | 7 | ✅ 7 pass | 4,3 s |
-| Carga | `bun run test:load` | — | — | ✅ 201 wallets reconciliadas, 0 inconsistências | ver LOAD_TEST.md |
+| Unitários (domínio, contratos, hash e patches) | `bun run test:unit` | 10 | 151 | ✅ 151 pass | 0,3 s |
+| Integração (PostgreSQL + LocalStack reais) | `bun run test:integration` | 10 | 98 | ✅ 98 pass | 52,8 s |
+| Concorrência (paralelismo real, processos reais) | `bun run test:concurrency` | 4 | 12 | ✅ 12 pass | 26,5 s |
+| Falhas (SIGKILL em pontos exatos) | `bun run test:fault` | 1 | 4 | ✅ 4 pass | 20,0 s |
+| **Subtotal `bun run test`** | | **25** | **265** | ✅ **265 pass, 0 fail** | |
+| E2E (processos compilados, banco/filas próprios) | `bun run test:e2e` | 1 | 7 | ✅ 7 pass | 8,9 s |
+| Carga (execução histórica, não repetida nesta correção) | `bun run test:load` | — | — | 201 wallets reconciliadas, 0 inconsistências | ver LOAD_TEST.md |
 
-Também verificados: `lint` ✅, `typecheck` ✅, `check:money` ✅ (95 arquivos; o check foi validado contra uma sonda com violações propositais, que ele recusa com exit 1), `build` ✅ (6 entrypoints compilados). Os números acima são da execução final, depois das correções da revisão (seção "Defeitos encontrados").
+Também verificados: `lint` ✅, `typecheck` ✅, `check:money` ✅ (96 arquivos), `build` ✅ (6 entrypoints compilados). **272 testes aprovados** incluindo E2E. Build Docker com lockfile congelado e patches, imagem de migration separada e smoke do Compose completo: jobs concluídos, serviços saudáveis, três APIs pelo nginx e reconciliação consistente. A verificação dos patches não elimina os dois alertas upstream que continuam aparecendo no `bun audit`; ver [AUDIT_FIXES.md](AUDIT_FIXES.md).
 
 ## Como os testes são isolados e realistas
 
@@ -66,13 +66,17 @@ Também verificados: `lint` ✅, `typecheck` ✅, `check:money` ✅ (95 arquivos
 
 Extras: deadlock provocado de forma determinística, com PostgreSQL escolhendo a vítima (`a provoked deadlock is detected by PostgreSQL, retried from scratch and applied exactly once`); `lock_timeout` com erro `503`-retryable e nada persistido; contenção medida; **PostgreSQL indisponível de verdade** (`ALLOW_CONNECTIONS false` + término das conexões) → `503 DATABASE_UNAVAILABLE`, readiness 503, liveness 200 e recuperação automática.
 
-### API HTTP (`http-api.test.ts`, 18 testes)
+### API HTTP (`http-api.test.ts`, 19 testes)
 
 Contratos e status de todos os endpoints: UUIDs em maiúsculas tratados como a mesma wallet e a mesma operação, `201` + `Location`, `200` replay com corpo idêntico e `Idempotent-Replayed`, `202` pendente, `400` (payload, JSON malformado, `Idempotency-Key` ausente, OPENING, campo desconhecido, valor inválido, cursor inválido, `limit` > 200), `404`, `409`, `422` (com `failureCode`, `transactionId`, saldo observado), `503`, propagação de `X-Correlation-Id`, paginação keyset ponta a ponta (asc/desc), reconciliação, health e `/metrics`.
 
-### E2E (`e2e/stack.test.ts`, 7 testes, contra o stack em execução)
+### E2E (`e2e/stack.test.ts`, 7 testes, processos compilados isolados)
 
-Round-robin entre as 3 réplicas (`X-Instance-Id`); todos os tipos de transação com verificação das linhas do ledger no banco; idempotência pelo nginx; mensagem SQS entregue 2× aos consumidores do stack (um efeito); REFUND antes da BET resolvido pelo `reference-worker`; eventos chegando a `wager-events.fifo` pelos `outbox-worker`; 80 + 80 pelo nginx. Ao final, `POST /reconciliation` de cada wallet tocada.
+Três APIs com `X-Instance-Id` distintos, três consumers, dois publishers e um reference worker, usando um banco novo e filas de nomes aleatórios. Todos os tipos de transação com verificação do ledger; idempotência entre APIs; mensagem SQS entregue 2× (um efeito); REFUND antes da BET resolvido pelo worker; eventos chegando à fila exclusiva da suíte; duas apostas concorrentes de 80,00 em saldo 100,00. Ao final, reconciliação de cada wallet e remoção dos recursos próprios. Não há purge nem consumo de eventos alheios. Nginx é conferido separadamente no smoke do Compose completo.
+
+### Regressões da auditoria
+
+`audit-regressions.test.ts` verifica SQL com login runtime contra backfill (inclusive quatro escritores concorrentes), múltiplos movimentos legítimos no mesmo commit, NaN e métricas pós-commit em rollback/retry/OPENING/reference worker. `migrations.test.ts` também cobre upgrade/down/up com histórico e recusa atômica de corrupção preexistente. O novo teste HTTP cobre moeda histórica da rejeição em replay e nos dois GETs. `date-immutability.test.ts` cobre mutação de datas de entrada/saída; `dependency-patches.test.ts` exercita os pacotes instalados. `consumer-shutdown.test.ts` reproduziu a devolução ausente após expirar o prazo e agora verifica liberação de todo o lote, interrupção dos heartbeats, ausência de ACK tardio e redelivery com efeito financeiro único.
 
 ## Defeitos encontrados pelos testes e corrigidos
 
@@ -83,7 +87,7 @@ Round-robin entre as 3 réplicas (`X-Instance-Id`); todos os tipos de transaçã
 
 ### Encontrados na revisão de código adversarial final (e cobertos por novos testes)
 
-Uma revisão independente e adversarial do núcleo financeiro não encontrou forma de duplicar débito/crédito, gerar saldo negativo, publicar antes do commit, perder eventos ou aplicar uma segunda reversão. Ela encontrou cinco casos em que **operações válidas falhavam** ou **erros transitórios viravam permanentes**, todos corrigidos:
+A revisão inicial do núcleo financeiro encontrou cinco casos em que **operações válidas falhavam** ou **erros transitórios viravam permanentes**, corrigidos abaixo. Posteriormente, a auditoria independente reproduziu também uma inserção histórica que quebrava a consistência do ledger e outros achados; as correções e regressões adicionais estão em [AUDIT_FIXES.md](AUDIT_FIXES.md). Os resultados desta revisão inicial não devem ser lidos como garantia de ausência de outras falhas:
 
 5. **Queda do banco esgotava tentativas.** Durante uma queda de ~30s o consumidor continuava recebendo mensagens e mandava a cabeça de cada grupo FIFO para a DLQ, o que liberava as mensagens seguintes do grupo fora de ordem. Agora o consumidor pausa até o banco responder. Teste: `a database outage longer than the retry budget pauses consumption instead of dead-lettering`.
 6. **`messageId` longo inviabilizava a mensagem.** O correlation id derivado de um `messageId` de 129 a 256 caracteres (válido pelo contrato) estourava `varchar(128)` no outbox. Agora só se usa um candidato que caiba, ou gera-se um UUID. Teste com `messageId` de 256 caracteres.

@@ -87,6 +87,8 @@ export class WagerTransactionsConsumer {
   private readonly backoff: ExponentialBackoff;
   private dlqTimer: ReturnType<typeof setInterval> | undefined;
   private databaseDown = false;
+  private abandoned = false;
+  private readonly inFlight = new Map<Message, { queueUrl: string; stopHeartbeat?: () => Promise<void> }>();
 
   constructor(
     private readonly sqs: SQSClient,
@@ -111,21 +113,55 @@ export class WagerTransactionsConsumer {
   }
 
   start(): void {
-    if (this.running) return;
+    // A timed-out drain may still be completing SQL. Do not start a second
+    // polling loop on this instance until that work has actually returned.
+    if (this.loop) return;
     this.running = true;
-    this.loop = this.run();
+    this.abandoned = false;
+    this.loop = this.run().finally(() => {
+      this.loop = undefined;
+      this.running = false;
+      clearInterval(this.dlqTimer);
+    });
     this.dlqTimer = setInterval(() => void this.refreshDlqDepth(), this.options.dlqDepthIntervalMs);
     this.dlqTimer.unref?.();
   }
 
   async stop(): Promise<void> {
-    if (!this.running) return;
+    if (!this.loop) return;
     this.running = false;
     clearInterval(this.dlqTimer);
     this.logger.info('Consumer stopping: finishing in-flight messages', {
       consumer: this.options.consumerName,
     });
-    await Promise.race([this.loop, sleep(this.options.shutdownTimeoutMs)]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let drained: boolean;
+    try {
+      drained = await Promise.race([
+        this.loop.then(() => true),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), this.options.shutdownTimeoutMs);
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (!drained) {
+      this.abandoned = true;
+      const owned = [...this.inFlight.entries()];
+      // Wait for any heartbeat already sent before releasing. Otherwise that
+      // request could finish after the release and make the message invisible again.
+      await Promise.all(
+        owned.map(async ([message, owner]) => {
+          await owner.stopHeartbeat?.();
+          await this.release(owner.queueUrl, [message]);
+        }),
+      );
+      this.logger.warn('Consumer shutdown deadline expired; unacknowledged messages released', {
+        consumer: this.options.consumerName,
+        messages: owned.length,
+      });
+    }
   }
 
   isRunning(): boolean {
@@ -166,6 +202,7 @@ export class WagerTransactionsConsumer {
         continue;
       }
       if (messages.length === 0) continue;
+      for (const message of messages) this.inFlight.set(message, { queueUrl });
       this.metrics.sqsMessagesReceived(messages.length);
       if (!this.running) {
         await this.release(queueUrl, messages);
@@ -209,6 +246,8 @@ export class WagerTransactionsConsumer {
   private async handle(queueUrl: string, message: Message): Promise<Outcome> {
     const receiveCount = receiveCountOf(message);
     const heartbeat = this.startHeartbeat(queueUrl, message);
+    const owner = this.inFlight.get(message);
+    if (owner) owner.stopHeartbeat = heartbeat;
     try {
       let envelope: WagerTransactionRequestedMessage;
       try {
@@ -232,7 +271,8 @@ export class WagerTransactionsConsumer {
         this.process(queueUrl, message, envelope, receiveCount, correlationId),
       );
     } finally {
-      heartbeat();
+      await heartbeat();
+      this.inFlight.delete(message);
     }
   }
 
@@ -256,9 +296,11 @@ export class WagerTransactionsConsumer {
         inbox: { consumerName: this.options.consumerName, messageId: envelope.messageId, receiveCount },
       });
     } catch (error) {
+      if (this.abandoned) return 'retry-scheduled';
       return this.onProcessingError(queueUrl, message, envelope, receiveCount, error);
     }
 
+    if (this.abandoned) return 'retry-scheduled';
     if (result.type === 'MESSAGE_ID_CONFLICT') {
       return this.deadLetter(queueUrl, message, 'MESSAGE_ID_CONFLICT', undefined, undefined, undefined);
     }
@@ -329,6 +371,7 @@ export class WagerTransactionsConsumer {
     messageId: string | undefined,
     payloadHash: string | undefined,
   ): Promise<Outcome> {
+    if (this.abandoned) return 'retry-scheduled';
     const receiveCount = receiveCountOf(message);
     const errorCode = error instanceof ApplicationError || error instanceof DomainError ? error.code : reason;
     try {
@@ -389,6 +432,7 @@ export class WagerTransactionsConsumer {
   }
 
   private async ack(queueUrl: string, message: Message, result: string): Promise<void> {
+    if (this.abandoned) return;
     try {
       await this.sqs.send(
         new DeleteMessageCommand({ QueueUrl: queueUrl, ReceiptHandle: message.ReceiptHandle }),
@@ -405,6 +449,7 @@ export class WagerTransactionsConsumer {
   }
 
   private async changeVisibility(queueUrl: string, message: Message, seconds: number): Promise<void> {
+    if (this.abandoned && seconds !== 0) return;
     try {
       await this.sqs.send(
         new ChangeMessageVisibilityCommand({
@@ -419,24 +464,38 @@ export class WagerTransactionsConsumer {
   }
 
   /** Keeps a message invisible while it is still being processed. */
-  private startHeartbeat(queueUrl: string, message: Message): () => void {
+  private startHeartbeat(queueUrl: string, message: Message): () => Promise<void> {
     const periodMs = Math.max(1000, (this.options.visibilityTimeoutSeconds * 1000) / 2);
+    let stopped = false;
+    let pending = Promise.resolve();
     const timer = setInterval(() => {
-      void this.changeVisibility(queueUrl, message, this.options.visibilityTimeoutSeconds).then(() =>
-        this.metrics.sqsVisibilityExtended(),
-      );
+      pending = pending.then(async () => {
+        if (stopped) return;
+        await this.changeVisibility(queueUrl, message, this.options.visibilityTimeoutSeconds);
+        this.metrics.sqsVisibilityExtended();
+      });
     }, periodMs);
     timer.unref?.();
-    return () => clearInterval(timer);
+    return async () => {
+      stopped = true;
+      clearInterval(timer);
+      await pending;
+    };
   }
 
   private async release(queueUrl: string, messages: Message[]): Promise<void> {
-    await Promise.all(messages.map((message) => this.changeVisibility(queueUrl, message, 0)));
+    // Once returned, an old receipt no longer belongs to this consumer. Late
+    // completion must not alter visibility after a successor has received it.
+    const owned = messages.filter((message) => this.inFlight.has(message));
+    for (const message of owned) this.inFlight.delete(message);
+    await Promise.all(owned.map((message) => this.changeVisibility(queueUrl, message, 0)));
   }
 
   private async postpone(queueUrl: string, messages: Message[], receiveCount: number): Promise<void> {
+    if (this.abandoned) return this.release(queueUrl, messages);
     const seconds = Math.ceil(this.backoff.delayAfterAttempt(receiveCount) / 1000);
     await Promise.all(messages.map((message) => this.changeVisibility(queueUrl, message, seconds)));
+    for (const message of messages) this.inFlight.delete(message);
   }
 
   /** Probes the database with exponential backoff (interruptible by stop) and resumes polling. */

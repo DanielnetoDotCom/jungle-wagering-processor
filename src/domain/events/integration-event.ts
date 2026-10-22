@@ -40,7 +40,7 @@ export abstract class IntegrationEvent<T> {
   readonly aggregateId: string;
   readonly correlationId: string;
   readonly causationId: string | undefined;
-  readonly occurredAt: Date;
+  private readonly occurredAtMs: number;
   readonly data: Readonly<T>;
 
   protected constructor(props: IntegrationEventProps<T>) {
@@ -48,8 +48,12 @@ export abstract class IntegrationEvent<T> {
     this.aggregateId = props.aggregateId;
     this.correlationId = props.correlationId;
     this.causationId = props.causationId;
-    this.occurredAt = new Date(props.occurredAt.getTime());
+    this.occurredAtMs = props.occurredAt.getTime();
     this.data = Object.freeze({ ...props.data });
+  }
+
+  get occurredAt(): Date {
+    return new Date(this.occurredAtMs);
   }
 
   /** Message group used for ordered delivery: events of one wallet share a group. */

@@ -3,6 +3,7 @@ import { Migration20261022000100CoreSchema } from './Migration20261022000100Core
 import { Migration20261022000200MessagingTables } from './Migration20261022000200MessagingTables';
 import { Migration20261022000300IntegrityTriggers } from './Migration20261022000300IntegrityTriggers';
 import { Migration20261022000400ApplicationRole } from './Migration20261022000400ApplicationRole';
+import { Migration20261022000500FinancialIntegrity } from './Migration20261022000500FinancialIntegrity';
 
 /**
  * Explicit, ordered migration list (no filesystem discovery): identical in
@@ -13,4 +14,5 @@ export const MIGRATIONS: MigrationObject[] = [
   { name: 'Migration20261022000200MessagingTables', class: Migration20261022000200MessagingTables },
   { name: 'Migration20261022000300IntegrityTriggers', class: Migration20261022000300IntegrityTriggers },
   { name: 'Migration20261022000400ApplicationRole', class: Migration20261022000400ApplicationRole },
+  { name: 'Migration20261022000500FinancialIntegrity', class: Migration20261022000500FinancialIntegrity },
 ];

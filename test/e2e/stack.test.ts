@@ -1,60 +1,67 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
-import {
-  DeleteMessageCommand,
-  PurgeQueueCommand,
-  ReceiveMessageCommand,
-  SendMessageCommand,
-  SQSClient,
-} from '@aws-sdk/client-sqs';
-import { Pool } from 'pg';
-import { testInfra } from '../support/environment';
+import { DeleteMessageCommand, ReceiveMessageCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { TestDatabase } from '../support/database';
+import { ServiceProcess, stopAll, type ServiceKind } from '../support/processes';
+import { TestQueues } from '../support/sqs';
 import { uniqueId, waitFor } from '../support/fixtures';
 
 /**
- * End-to-end against the running `docker compose` stack:
- * client -> nginx -> 3 API replicas; SQS -> 3 consumer replicas; outbox
- * workers -> wager-events.fifo; reference worker. Verifies HTTP results AND
- * the database (ledger, inbox, outbox) AND the broker.
+ * End-to-end with compiled service entrypoints, a fresh database and unique
+ * FIFO queues. Three APIs, three consumers, two publishers and one reference
+ * worker share only these suite-owned resources. Never targets a running app's
+ * database/queues or purges a queue. Nginx routing is a separate Compose smoke check.
  *
- *   docker compose up -d --build
  *   docker compose --profile tools run --rm toolbox bun run test:e2e
  */
-const BASE_URL = process.env.E2E_BASE_URL ?? 'http://localhost:8080';
-const QUEUE_BASE = `${testInfra.awsEndpoint}/000000000000`;
-
-describe('E2E: docker compose stack', () => {
-  let db: Pool;
-  let sqs: SQSClient;
+describe('E2E: isolated compiled services', () => {
+  let database: TestDatabase;
+  let queues: TestQueues;
+  const services: ServiceProcess[] = [];
+  const apis: ServiceProcess[] = [];
+  let requestIndex = 0;
   const touchedWallets: string[] = [];
 
   beforeAll(async () => {
-    db = new Pool({
-      host: testInfra.dbHost,
-      port: testInfra.dbPort,
-      user: testInfra.adminUser,
-      password: testInfra.adminPassword,
-      database: process.env.E2E_DB_NAME ?? 'wagering',
-      max: 4,
-    });
-    sqs = new SQSClient({
-      region: testInfra.awsRegion,
-      endpoint: testInfra.awsEndpoint,
-      credentials: { accessKeyId: 'test', secretAccessKey: 'test' },
-    });
-    const ready = await fetch(`${BASE_URL}/health/ready`).catch(() => undefined);
-    if (!ready?.ok)
-      throw new Error(`Stack not ready at ${BASE_URL}: run "docker compose up -d --build" first`);
+    database = await TestDatabase.create('e2e');
+    queues = await TestQueues.create('e2e');
+    const kinds: ServiceKind[] = [
+      'api',
+      'api',
+      'api',
+      'consumer',
+      'consumer',
+      'consumer',
+      'outbox-worker',
+      'outbox-worker',
+      'reference-worker',
+    ];
+    // Register each process before awaiting readiness so failed setup is cleaned up too.
+    for (const kind of kinds) {
+      const service = await ServiceProcess.start({
+        kind,
+        dbName: database.name,
+        queues: queues.names,
+        compiled: true,
+        waitUntilReady: false,
+      });
+      services.push(service);
+      if (kind === 'api') apis.push(service);
+    }
+    await Promise.all(services.map((service) => service.waitUntilReady()));
   });
 
   afterAll(async () => {
-    // Final invariant for every wallet this suite touched, through the public API.
-    for (const walletId of touchedWallets) {
-      const report = await call<{ consistent: boolean }>('POST', `/wallets/${walletId}/reconciliation`);
-      expect(report.body.consistent).toBe(true);
+    try {
+      for (const walletId of touchedWallets) {
+        const report = await call<{ consistent: boolean }>('POST', `/wallets/${walletId}/reconciliation`);
+        expect(report.body.consistent).toBe(true);
+      }
+    } finally {
+      await stopAll(services);
+      await queues?.destroy();
+      await database?.drop();
     }
-    await db.end();
-    sqs.destroy();
   });
 
   async function call<T = Record<string, unknown>>(
@@ -63,7 +70,9 @@ describe('E2E: docker compose stack', () => {
     body?: unknown,
     headers: Record<string, string> = {},
   ) {
-    const response = await fetch(`${BASE_URL}${path}`, {
+    const api = apis[requestIndex++ % apis.length];
+    if (!api) throw new Error('Isolated APIs have not started');
+    const response = await fetch(`${api.url}${path}`, {
       method,
       headers: { 'content-type': 'application/json', ...headers },
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -102,16 +111,16 @@ describe('E2E: docker compose stack', () => {
       'Idempotency-Key': `provider-e2e:${body.externalTransactionId}`,
     });
 
-  test('nginx distributes requests across the three API replicas', async () => {
+  test('three independent compiled API replicas serve requests', async () => {
     const instances = new Set<string>();
     for (let index = 0; index < 30; index += 1) {
-      const response = await fetch(`${BASE_URL}/health/live`);
+      const response = await call('GET', '/health/live');
       instances.add(response.headers.get('x-instance-id') ?? '');
     }
     expect(instances.size).toBeGreaterThanOrEqual(3);
   });
 
-  test('BET, WIN, LOSS, REFUND, ROLLBACK through the load balancer, with DB verification', async () => {
+  test('BET, WIN, LOSS, REFUND, ROLLBACK across API replicas, with DB verification', async () => {
     const { walletId, playerId } = await createWallet('100.00');
     const bet = wager(walletId, playerId, { money: { amount: '40.00', currency: 'BRL' } });
     expect((await submit(bet)).body).toMatchObject({ status: 'PROCESSED', balance: { amount: '60.00' } });
@@ -156,7 +165,7 @@ describe('E2E: docker compose stack', () => {
       body: { code: 'REFERENCE_ALREADY_REVERSED' },
     });
 
-    const lines = await db.query<{ direction: string; amount: string }>(
+    const lines = await database.admin.query<{ direction: string; amount: string }>(
       `SELECT direction, amount::text FROM wallet_ledger_entries WHERE wallet_id = $1 ORDER BY wallet_version`,
       [walletId],
     );
@@ -169,7 +178,7 @@ describe('E2E: docker compose stack', () => {
     ]);
   });
 
-  test('idempotency through nginx: replay keeps the historical balance; conflict on a changed payload', async () => {
+  test('idempotency across replicas: replay keeps the historical balance; conflict on a changed payload', async () => {
     const { walletId, playerId } = await createWallet('100.00');
     const bet = wager(walletId, playerId, { money: { amount: '20.00', currency: 'BRL' } });
     expect((await submit(bet)).status).toBe(201);
@@ -197,9 +206,9 @@ describe('E2E: docker compose stack', () => {
       data,
     });
     for (const copy of ['a', 'b']) {
-      await sqs.send(
+      await queues.sqs.send(
         new SendMessageCommand({
-          QueueUrl: `${QUEUE_BASE}/wager-transactions.fifo`,
+          QueueUrl: queues.urls.transactionsQueueUrl,
           MessageBody: body,
           MessageGroupId: walletId,
           MessageDeduplicationId: `${messageId}-${copy}`,
@@ -219,7 +228,7 @@ describe('E2E: docker compose stack', () => {
     expect(settled).toMatchObject({ status: 'PROCESSED', balance: { amount: '37.66' } });
     await waitFor(
       async () => {
-        const inbox = await db.query(
+        const inbox = await database.admin.query(
           `SELECT 1 FROM inbox_messages WHERE message_id = $1 AND status = 'PROCESSED'`,
           [messageId],
         );
@@ -228,7 +237,7 @@ describe('E2E: docker compose stack', () => {
       { description: 'inbox row' },
     );
     await new Promise((resolve) => setTimeout(resolve, 3000)); // let the duplicate be consumed too
-    const debits = await db.query(
+    const debits = await database.admin.query(
       `SELECT 1 FROM wallet_ledger_entries WHERE wallet_id = $1 AND direction = 'DEBIT'`,
       [walletId],
     );
@@ -271,16 +280,11 @@ describe('E2E: docker compose stack', () => {
   });
 
   test('committed events reach wager-events.fifo through the outbox workers', async () => {
-    // Nothing consumes wager-events.fifo inside the stack, so it accumulates every event
-    // ever published (e.g. by load tests). Purge it first so the search below is bounded.
-    await sqs
-      .send(new PurgeQueueCommand({ QueueUrl: `${QUEUE_BASE}/wager-events.fifo` }))
-      .catch(() => undefined); // PurgeQueueInProgress: a purge ran less than 60s ago
     const { walletId, playerId } = await createWallet('10.00');
     await submit(wager(walletId, playerId, { money: { amount: '1.00', currency: 'BRL' } }));
     await waitFor(
       async () => {
-        const pending = await db.query(
+        const pending = await database.admin.query(
           `SELECT 1 FROM outbox_messages WHERE message_group_id = $1 AND status <> 'PUBLISHED'`,
           [walletId],
         );
@@ -291,9 +295,9 @@ describe('E2E: docker compose stack', () => {
     const types = new Set<string>();
     await waitFor(
       async () => {
-        const response = await sqs.send(
+        const response = await queues.sqs.send(
           new ReceiveMessageCommand({
-            QueueUrl: `${QUEUE_BASE}/wager-events.fifo`,
+            QueueUrl: queues.urls.eventsQueueUrl,
             MaxNumberOfMessages: 10,
             WaitTimeSeconds: 1,
           }),
@@ -304,9 +308,9 @@ describe('E2E: docker compose stack', () => {
             data: { walletId?: string };
           };
           if (envelope.data.walletId === walletId) types.add(envelope.eventType);
-          await sqs.send(
+          await queues.sqs.send(
             new DeleteMessageCommand({
-              QueueUrl: `${QUEUE_BASE}/wager-events.fifo`,
+              QueueUrl: queues.urls.eventsQueueUrl,
               ReceiptHandle: message.ReceiptHandle,
             }),
           );
@@ -318,7 +322,7 @@ describe('E2E: docker compose stack', () => {
     expect([...types].sort()).toEqual(['WagerTransactionProcessed', 'WalletBalanceChanged']);
   });
 
-  test('two concurrent 80.00 bets on 100.00 through nginx: one 201, one 422, balance 20.00', async () => {
+  test('two concurrent 80.00 bets on 100.00 across replicas: one 201, one 422, balance 20.00', async () => {
     const { walletId, playerId } = await createWallet('100.00');
     const responses = await Promise.all([
       submit(wager(walletId, playerId, { money: { amount: '80.00', currency: 'BRL' } })),

@@ -6,7 +6,7 @@ import type {
 } from '../../../application/ports/persistence.ports';
 import type { WagerTransaction } from '../../../domain/wagering/wager-transaction';
 import { toWagerTransaction, wagerTransactionData } from './mappers';
-import { WagerTransactionRecord } from './records';
+import { WagerTransactionRecord, WalletRecord } from './records';
 import { isUuid, sql } from './sql';
 
 export class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
@@ -15,7 +15,7 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
   async findById(id: string): Promise<WagerTransaction | undefined> {
     if (!isUuid(id)) return undefined;
     const record = await this.em.findOne(WagerTransactionRecord, { id });
-    return record ? toWagerTransaction(record) : undefined;
+    return record ? this.toDomain(record) : undefined;
   }
 
   async lockById(id: string): Promise<WagerTransaction | undefined> {
@@ -25,7 +25,7 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
       { id },
       { lockMode: LockMode.PESSIMISTIC_WRITE, refresh: true },
     );
-    return record ? toWagerTransaction(record) : undefined;
+    return record ? this.toDomain(record) : undefined;
   }
 
   async findByIdempotencyKey(
@@ -37,7 +37,7 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
       { providerId, idempotencyKey },
       { refresh: true },
     );
-    return record ? toWagerTransaction(record) : undefined;
+    return record ? this.toDomain(record) : undefined;
   }
 
   async findByExternalId(
@@ -49,7 +49,12 @@ export class MikroOrmWagerTransactionRepository implements WagerTransactionRepos
       { providerId, externalTransactionId },
       { refresh: true },
     );
-    return record ? toWagerTransaction(record) : undefined;
+    return record ? this.toDomain(record) : undefined;
+  }
+
+  private async toDomain(record: WagerTransactionRecord): Promise<WagerTransaction> {
+    const wallet = await this.em.findOneOrFail(WalletRecord, { id: record.walletId });
+    return toWagerTransaction(record, wallet.currency);
   }
 
   async hasProcessedReversal(referenceTransactionId: string): Promise<boolean> {

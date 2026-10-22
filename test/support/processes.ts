@@ -53,6 +53,7 @@ export class ServiceProcess {
     queues?: TestQueueNames;
     env?: Record<string, string>;
     waitUntilReady?: boolean;
+    compiled?: boolean;
   }): Promise<ServiceProcess> {
     for (let attempt = 1; ; attempt += 1) {
       const service = await ServiceProcess.spawn(params);
@@ -73,6 +74,7 @@ export class ServiceProcess {
     dbName: string;
     queues?: TestQueueNames;
     env?: Record<string, string>;
+    compiled?: boolean;
   }): Promise<ServiceProcess> {
     const port = await freePort();
     const env = {
@@ -86,7 +88,10 @@ export class ServiceProcess {
       DB_POOL_MAX: '10',
       ...params.env,
     };
-    const child = Bun.spawn(['bun', `src/entrypoints/${params.kind}.ts`], {
+    const entrypoint = params.compiled
+      ? `dist/src/entrypoints/${params.kind}.js`
+      : `src/entrypoints/${params.kind}.ts`;
+    const child = Bun.spawn(['bun', entrypoint], {
       cwd: ROOT,
       env,
       stdout: 'pipe',

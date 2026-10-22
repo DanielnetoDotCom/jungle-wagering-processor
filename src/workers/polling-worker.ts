@@ -63,7 +63,7 @@ export abstract class PollingWorker {
 
   private async run(): Promise<void> {
     while (this.running) {
-      let didWork = false;
+      let didWork: boolean;
       try {
         didWork = await this.tick();
       } catch (error) {

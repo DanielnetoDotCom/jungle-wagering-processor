@@ -4,7 +4,15 @@ import prettier from 'eslint-config-prettier';
 import { defineConfig } from 'eslint/config';
 import tseslint from 'typescript-eslint';
 
-const frameworkPackages = ['@nestjs/*', '@mikro-orm/*', '@aws-sdk/*', 'pino', 'prom-client', 'express', 'pg'];
+const frameworkPackages = [
+  '@nestjs/*',
+  '@mikro-orm/*',
+  '@aws-sdk/*',
+  'pino',
+  '@prometheus-io/client',
+  'express',
+  'pg',
+];
 
 export default defineConfig(
   {

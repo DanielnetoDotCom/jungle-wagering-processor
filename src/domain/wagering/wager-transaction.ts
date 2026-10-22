@@ -34,8 +34,8 @@ export interface CreateWagerTransactionProps {
 
 /** Wallet balance/version observed when the transaction reached its current state. */
 export interface TransactionResult {
-  balance: Money;
-  walletVersion: number;
+  readonly balance: Money;
+  readonly walletVersion: number;
 }
 
 export interface WagerTransactionState extends CreateWagerTransactionProps {
@@ -109,7 +109,7 @@ export class WagerTransaction {
     public readonly kind: WagerTransactionKind,
     public readonly money: Money,
     public readonly referenceExternalTransactionId: string | undefined,
-    public readonly createdAt: Date,
+    private readonly _createdAt: Date,
     private _status: WagerTransactionStatus,
     private _referenceTransactionId: string | undefined,
     private _failureCode: FailureCode | undefined,
@@ -119,7 +119,14 @@ export class WagerTransaction {
     private _nextAttemptAt: Date | undefined,
     private _referenceExpiresAt: Date | undefined,
     private _updatedAt: Date,
-  ) {}
+  ) {
+    this._createdAt = new Date(_createdAt.getTime());
+    this._processedAt = _processedAt && new Date(_processedAt.getTime());
+    this._nextAttemptAt = _nextAttemptAt && new Date(_nextAttemptAt.getTime());
+    this._referenceExpiresAt = _referenceExpiresAt && new Date(_referenceExpiresAt.getTime());
+    this._updatedAt = new Date(_updatedAt.getTime());
+    this._result = _result && Object.freeze({ ..._result });
+  }
 
   /** Born PENDING. Validates channel and reference requirements per kind. */
   static create(props: CreateWagerTransactionProps): WagerTransaction {
@@ -194,7 +201,11 @@ export class WagerTransaction {
 
   /** Moment the transaction reached a terminal state. */
   get processedAt(): Date | undefined {
-    return this._processedAt;
+    return this._processedAt && new Date(this._processedAt.getTime());
+  }
+
+  get createdAt(): Date {
+    return new Date(this._createdAt.getTime());
   }
 
   /** Snapshot returned on idempotent replays: the balance observed at the time, not the current one. */
@@ -207,15 +218,15 @@ export class WagerTransaction {
   }
 
   get nextAttemptAt(): Date | undefined {
-    return this._nextAttemptAt;
+    return this._nextAttemptAt && new Date(this._nextAttemptAt.getTime());
   }
 
   get referenceExpiresAt(): Date | undefined {
-    return this._referenceExpiresAt;
+    return this._referenceExpiresAt && new Date(this._referenceExpiresAt.getTime());
   }
 
   get updatedAt(): Date {
-    return this._updatedAt;
+    return new Date(this._updatedAt.getTime());
   }
 
   // ---- transitions ---------------------------------------------------------
@@ -250,24 +261,24 @@ export class WagerTransaction {
       throw new InvariantViolationError('Only transactions with a reference can wait for it');
     }
     this._status = WagerTransactionStatus.PendingReference;
-    this._nextAttemptAt = props.nextAttemptAt;
-    this._referenceExpiresAt = props.expiresAt;
-    this._result = props.result;
-    this._updatedAt = props.at;
+    this._nextAttemptAt = new Date(props.nextAttemptAt.getTime());
+    this._referenceExpiresAt = new Date(props.expiresAt.getTime());
+    this._result = Object.freeze({ ...props.result });
+    this._updatedAt = new Date(props.at.getTime());
   }
 
   /** Counts one worker attempt to resolve the reference, whatever its outcome. */
   registerReferenceAttempt(at: Date): void {
     this.assertWaitingForReference();
     this._referenceAttempts += 1;
-    this._updatedAt = at;
+    this._updatedAt = new Date(at.getTime());
   }
 
   /** The attempt did not settle the transaction: it stays PENDING_REFERENCE until `nextAttemptAt`. */
   scheduleReferenceRetry(props: { at: Date; nextAttemptAt: Date }): void {
     this.assertWaitingForReference();
-    this._nextAttemptAt = props.nextAttemptAt;
-    this._updatedAt = props.at;
+    this._nextAttemptAt = new Date(props.nextAttemptAt.getTime());
+    this._updatedAt = new Date(props.at.getTime());
   }
 
   reject(code: FailureCode, props: { at: Date; result: TransactionResult }): void {
@@ -360,9 +371,9 @@ export class WagerTransaction {
   }
 
   private settle(at: Date, result: TransactionResult): void {
-    this._processedAt = at;
-    this._updatedAt = at;
-    this._result = result;
+    this._processedAt = new Date(at.getTime());
+    this._updatedAt = new Date(at.getTime());
+    this._result = Object.freeze({ ...result });
     this._nextAttemptAt = undefined;
   }
 

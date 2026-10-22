@@ -1,4 +1,4 @@
-import { Counter, Gauge, Histogram, Registry } from 'prom-client';
+import { Counter, Gauge, Histogram, Registry } from '@prometheus-io/client';
 import type { RetryReason, WageringMetrics } from '../../application/ports/metrics.port';
 import type { OutboxBacklog } from '../../application/ports/persistence.ports';
 import type { TransactionChannel, WagerTransactionKind } from '../../domain/wagering/wager-transaction-types';

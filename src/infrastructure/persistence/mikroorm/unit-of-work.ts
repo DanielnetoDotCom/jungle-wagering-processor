@@ -11,6 +11,7 @@ import type {
   WalletRepository,
 } from '../../../application/ports/persistence.ports';
 import { translateDatabaseError } from './database-errors';
+import type { Logger } from '../../../application/ports/runtime.ports';
 import { MikroOrmLedgerRepository } from './ledger.repository';
 import { MikroOrmInboxRepository, MikroOrmOutboxRepository } from './messaging.repositories';
 import { MikroOrmWagerTransactionRepository } from './wager-transaction.repository';
@@ -23,7 +24,10 @@ class MikroOrmTransactionalScope implements TransactionalScope {
   readonly inbox: InboxRepository;
   readonly outbox: OutboxRepository;
 
-  constructor(private readonly em: SqlEntityManager) {
+  constructor(
+    private readonly em: SqlEntityManager,
+    private readonly observations: Array<() => void>,
+  ) {
     this.wallets = new MikroOrmWalletRepository(em);
     this.transactions = new MikroOrmWagerTransactionRepository(em);
     this.ledger = new MikroOrmLedgerRepository(em);
@@ -34,6 +38,10 @@ class MikroOrmTransactionalScope implements TransactionalScope {
   flush(): Promise<void> {
     return this.em.flush();
   }
+
+  afterCommit(observe: () => void): void {
+    this.observations.push(observe);
+  }
 }
 
 /**
@@ -43,20 +51,42 @@ class MikroOrmTransactionalScope implements TransactionalScope {
  * any error, so no partial state can survive a failure.
  */
 export class MikroOrmUnitOfWork implements UnitOfWork {
-  constructor(private readonly orm: MikroORM) {}
+  constructor(
+    private readonly orm: MikroORM,
+    private readonly logger: Logger,
+  ) {}
 
   async run<T>(work: (scope: TransactionalScope) => Promise<T>, options: UnitOfWorkOptions = {}): Promise<T> {
     const em = this.orm.em.fork({ clear: true, useContext: false });
+    const observations: Array<() => void> = [];
+    let result: T;
     try {
-      return await em.transactional((transactionEm) => work(new MikroOrmTransactionalScope(transactionEm)), {
-        isolationLevel:
-          options.isolation === 'repeatable read'
-            ? IsolationLevel.REPEATABLE_READ
-            : IsolationLevel.READ_COMMITTED,
-        readOnly: options.readOnly ?? false,
-      });
+      result = await em.transactional(
+        (transactionEm) => work(new MikroOrmTransactionalScope(transactionEm, observations)),
+        {
+          isolationLevel:
+            options.isolation === 'repeatable read'
+              ? IsolationLevel.REPEATABLE_READ
+              : IsolationLevel.READ_COMMITTED,
+          readOnly: options.readOnly ?? false,
+        },
+      );
     } catch (error) {
       throw translateDatabaseError(error);
     }
+    // A failed metric must never turn an already committed financial operation
+    // into an apparent failure, nor cause the transaction retry loop to run again.
+    for (const observe of observations) {
+      try {
+        observe();
+      } catch {
+        try {
+          this.logger.error('Post-commit observation failed');
+        } catch {
+          // COMMIT has succeeded even if the observation and its logger fail.
+        }
+      }
+    }
+    return result;
   }
 }

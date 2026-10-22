@@ -139,7 +139,7 @@ async function virtualUser(wallets: Wallet[], hot: Wallet, deadline: number): Pr
       if (sentBodies.length < 5000) sentBodies.push({ body, key });
     }
     const started = performance.now();
-    let status = 0;
+    let status: number;
     try {
       status = (await post('/wagering/transactions', body, { 'Idempotency-Key': key })).status;
     } catch {

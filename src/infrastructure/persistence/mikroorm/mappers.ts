@@ -53,11 +53,13 @@ export function walletData(wallet: Wallet): WalletRecord {
   };
 }
 
-export function toWagerTransaction(record: WagerTransactionRecord): WagerTransaction {
+export function toWagerTransaction(record: WagerTransactionRecord, walletCurrency: string): WagerTransaction {
   const result =
     record.resultBalanceAmount !== null && record.resultWalletVersion !== null
       ? {
-          balance: money(record.resultBalanceAmount, record.currency),
+          // A rejected operation may use a different currency from its wallet.
+          // Wallet currency is immutable, including for historical snapshots.
+          balance: money(record.resultBalanceAmount, walletCurrency),
           walletVersion: record.resultWalletVersion,
         }
       : undefined;

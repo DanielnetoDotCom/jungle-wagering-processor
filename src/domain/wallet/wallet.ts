@@ -59,9 +59,12 @@ export class Wallet {
     public readonly currency: string,
     private _balance: Money,
     private _version: number,
-    public readonly createdAt: Date,
+    private readonly _createdAt: Date,
     private _updatedAt: Date,
-  ) {}
+  ) {
+    this._createdAt = new Date(_createdAt.getTime());
+    this._updatedAt = new Date(_updatedAt.getTime());
+  }
 
   static open(props: OpenWalletProps): WalletOpening {
     if (props.id.trim() === '' || props.playerId.trim() === '') {
@@ -122,7 +125,11 @@ export class Wallet {
   }
 
   get updatedAt(): Date {
-    return this._updatedAt;
+    return new Date(this._updatedAt.getTime());
+  }
+
+  get createdAt(): Date {
+    return new Date(this._createdAt.getTime());
   }
 
   snapshot(): WalletSnapshot {
@@ -175,7 +182,7 @@ export class Wallet {
     // State changes only after the entry has been proven balanced.
     this._balance = balanceAfter;
     this._version = entry.walletVersion;
-    this._updatedAt = at;
+    this._updatedAt = new Date(at.getTime());
     return entry;
   }
 

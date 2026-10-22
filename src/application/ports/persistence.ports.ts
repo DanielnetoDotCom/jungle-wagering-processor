@@ -121,6 +121,8 @@ export interface TransactionalScope {
   readonly outbox: OutboxRepository;
   /** Sends pending writes inside the open transaction (constraint violations surface here). */
   flush(): Promise<void>;
+  /** Best-effort synchronous observations, run only after a successful COMMIT. Not durable event delivery. */
+  afterCommit(observe: () => void): void;
 }
 
 export interface UnitOfWorkOptions {

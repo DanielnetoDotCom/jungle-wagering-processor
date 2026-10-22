@@ -75,7 +75,7 @@ export async function createCore(config: AppConfig, overrides: CoreOverrides = {
     applicationName: `${config.serviceName}:${config.instanceId}`.slice(0, 63),
     withMigrator: overrides.withMigrator ?? false,
   });
-  const uow = new MikroOrmUnitOfWork(orm);
+  const uow = new MikroOrmUnitOfWork(orm, logger);
   const sqs = createSqsClient(config);
   const queues = new QueueUrlResolver(sqs);
 

@@ -137,7 +137,9 @@ export class SettlementRecorder {
       });
     }
     if (outcome.type !== 'REFERENCE_RETRY_SCHEDULED') {
-      this.metrics.transactionRecorded(transaction.kind, transaction.status, transaction.channel);
+      scope.afterCommit(() =>
+        this.metrics.transactionRecorded(transaction.kind, transaction.status, transaction.channel),
+      );
     }
   }
 

@@ -31,9 +31,13 @@ export class WalletLedgerEntry {
     public readonly balanceBefore: Money,
     public readonly balanceAfter: Money,
     public readonly walletVersion: number,
-    public readonly createdAt: Date,
+    private readonly createdAtMs: number,
   ) {
     Object.freeze(this);
+  }
+
+  get createdAt(): Date {
+    return new Date(this.createdAtMs);
   }
 
   static create(props: CreateLedgerEntryProps): WalletLedgerEntry {
@@ -90,7 +94,7 @@ export class WalletLedgerEntry {
       props.balanceBefore,
       props.balanceAfter,
       props.walletVersion,
-      new Date(props.createdAt.getTime()),
+      props.createdAt.getTime(),
     );
   }
 }

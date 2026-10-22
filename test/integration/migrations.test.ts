@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MIGRATIONS } from '../../migrations';
 import { TestDatabase } from '../support/database';
+import { createTestCore } from '../support/core';
+import { httpCommand, payload, uniqueId } from '../support/fixtures';
 
 const TABLES = [
   'wallets',
@@ -77,7 +79,9 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
 
   test('down reverts one step; down --all removes the whole schema; up rebuilds it', async () => {
     const reverted = await TestDatabase.migrate(db.name, 'down');
-    expect(reverted).toEqual(['Migration20261022000400ApplicationRole']);
+    expect(reverted).toEqual(['Migration20261022000500FinancialIntegrity']);
+    expect(await executed()).toHaveLength(MIGRATIONS.length - 1);
+    expect(await TestDatabase.migrate(db.name, 'down')).toEqual(['Migration20261022000400ApplicationRole']);
     const revoked = await db.one<{ ledger_insert: boolean }>(
       `SELECT has_table_privilege('wagering_app', 'wallet_ledger_entries', 'INSERT') AS ledger_insert`,
     );
@@ -98,5 +102,90 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
 
   test('running up again is a no-op', async () => {
     expect(await TestDatabase.migrate(db.name, 'up')).toEqual([]);
+  });
+
+  test('financial integrity upgrade and rollback preserve populated wallets and ledger history', async () => {
+    await TestDatabase.migrate(db.name, 'down');
+    const core = await createTestCore(db);
+    try {
+      for (const amount of ['0.00', '100.00']) {
+        const wallet = await core.createWallet.execute({
+          playerId: uniqueId('upgrade'),
+          initialBalance: { amount, currency: 'BRL' },
+          correlationId: 'c',
+        });
+        await core.processWager.execute(
+          httpCommand(
+            payload({ walletId: wallet.id, playerId: wallet.playerId, kind: 'WIN', amount: '20.00' }),
+          ),
+        );
+      }
+    } finally {
+      await core.close();
+    }
+    const before = await db.query('SELECT * FROM wallet_ledger_entries ORDER BY id');
+    expect(before).toHaveLength(3);
+    await TestDatabase.migrate(db.name, 'up');
+    expect(await db.query('SELECT * FROM wallet_ledger_entries ORDER BY id')).toEqual(before);
+    await TestDatabase.migrate(db.name, 'down');
+    expect(await db.query('SELECT * FROM wallet_ledger_entries ORDER BY id')).toEqual(before);
+    await TestDatabase.migrate(db.name, 'up');
+    expect(await db.query('SELECT * FROM wallet_ledger_entries ORDER BY id')).toEqual(before);
+  });
+
+  test('upgrade refuses old divergent history atomically without repairing or deleting it', async () => {
+    const corrupt = await TestDatabase.create('legacy_corrupt');
+    try {
+      await TestDatabase.migrate(corrupt.name, 'down');
+      const core = await createTestCore(corrupt);
+      let wallet: { id: string; playerId: string };
+      try {
+        wallet = await core.createWallet.execute({
+          playerId: uniqueId('legacy'),
+          initialBalance: { amount: '0.00', currency: 'BRL' },
+          correlationId: 'c',
+        });
+        await core.processWager.execute(
+          httpCommand(
+            payload({ walletId: wallet.id, playerId: wallet.playerId, kind: 'WIN', amount: '20.00' }),
+          ),
+        );
+      } finally {
+        await core.close();
+      }
+      const app = await corrupt.appClient();
+      try {
+        await app.query('BEGIN');
+        const tx = await app.query<{ id: string }>(
+          `INSERT INTO wager_transactions
+          (id,provider_id,external_transaction_id,idempotency_key,payload_hash,channel,wallet_id,player_id,round_id,game_id,
+           kind,amount,currency,status,result_balance_amount,result_wallet_version,created_at,updated_at,processed_at)
+          VALUES (gen_random_uuid(),'legacy','backfill','backfill',repeat('a',64),'HTTP',$1,$2,'r','g',
+                  'WIN',10,'BRL','PROCESSED',10,1,now(),now(),now()) RETURNING id`,
+          [wallet.id, wallet.playerId],
+        );
+        await app.query(
+          `INSERT INTO wallet_ledger_entries VALUES
+          (gen_random_uuid(),$1,$2,'CREDIT',10,'BRL',0,10,1,now())`,
+          [wallet.id, tx.rows[0]!.id],
+        );
+        await app.query('COMMIT'); // Reproduces the vulnerability on the old schema only.
+      } finally {
+        await app.end();
+      }
+      const history = await corrupt.query('SELECT * FROM wallet_ledger_entries ORDER BY id');
+      await expect(TestDatabase.migrate(corrupt.name, 'up')).rejects.toThrow();
+      expect(await corrupt.query('SELECT * FROM wallet_ledger_entries ORDER BY id')).toEqual(history);
+      expect(await corrupt.one('SELECT count(*)::int AS count FROM mikro_orm_migrations')).toEqual({
+        count: 4,
+      });
+      expect(
+        await corrupt.one(
+          `SELECT count(*)::int AS count FROM pg_constraint WHERE conname='wallets_balance_finite_ck'`,
+        ),
+      ).toEqual({ count: 0 });
+    } finally {
+      await corrupt.drop();
+    }
   });
 });

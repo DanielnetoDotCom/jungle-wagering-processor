@@ -157,6 +157,31 @@ describe('REST API (Nest + Express, real PostgreSQL and SQS)', () => {
   });
 
   describe('POST /wagering/transactions', () => {
+    test('currency mismatch retains the wallet currency on replay and both GET routes', async () => {
+      const { walletId, playerId } = await createWallet();
+      const body = wager(walletId, playerId, { money: { amount: '10.00', currency: 'USD' } });
+      const first = await submit(body);
+      expect(first).toMatchObject({
+        status: 422,
+        body: { balance: { amount: '100.00', currency: 'BRL' } },
+      });
+      await submit(wager(walletId, playerId)); // Move the wallet after recording the rejection.
+      const replay = await submit(body);
+      expect(replay.body).toEqual({
+        ...first.body,
+        correlationId: replay.body.correlationId,
+        idempotentReplay: true,
+      });
+      for (const path of [
+        `/wagering/transactions/${String(first.body.transactionId)}`,
+        `/providers/provider-a/wagering/transactions/${String(body.externalTransactionId)}`,
+      ]) {
+        expect((await call('GET', path)).body).toMatchObject({
+          balance: { amount: '100.00', currency: 'BRL' },
+        });
+      }
+    });
+
     test('201 PROCESSED, then 200 replay with the same body and idempotentReplay=true', async () => {
       const { walletId, playerId } = await createWallet();
       const body = wager(walletId, playerId, { money: { amount: '25.00', currency: 'BRL' } });

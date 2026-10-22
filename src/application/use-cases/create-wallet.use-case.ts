@@ -104,7 +104,9 @@ export class CreateWalletUseCase {
               'Wallet',
             ),
           );
-          this.metrics.transactionRecorded(opening.kind, opening.status, opening.channel);
+          scope.afterCommit(() =>
+            this.metrics.transactionRecorded(opening.kind, opening.status, opening.channel),
+          );
         }
         return wallet;
       });

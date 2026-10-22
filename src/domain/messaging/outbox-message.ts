@@ -46,13 +46,17 @@ export class OutboxMessage {
     public readonly correlationId: string,
     public readonly causationId: string | undefined,
     public readonly payload: Readonly<Record<string, unknown>>,
-    public readonly occurredAt: Date,
+    private readonly _occurredAt: Date,
     private _status: OutboxStatus,
     private _attempts: number,
     private _nextAttemptAt: Date,
     private _publishedAt: Date | undefined,
     private _lastError: string | undefined,
-  ) {}
+  ) {
+    this._occurredAt = new Date(_occurredAt.getTime());
+    this._nextAttemptAt = new Date(_nextAttemptAt.getTime());
+    this._publishedAt = _publishedAt && new Date(_publishedAt.getTime());
+  }
 
   static enqueue(event: IntegrationEvent<unknown>, aggregateType: string): OutboxMessage {
     const envelope = event.toJSON();
@@ -104,11 +108,15 @@ export class OutboxMessage {
   }
 
   get nextAttemptAt(): Date {
-    return this._nextAttemptAt;
+    return new Date(this._nextAttemptAt.getTime());
+  }
+
+  get occurredAt(): Date {
+    return new Date(this._occurredAt.getTime());
   }
 
   get publishedAt(): Date | undefined {
-    return this._publishedAt;
+    return this._publishedAt && new Date(this._publishedAt.getTime());
   }
 
   get lastError(): string | undefined {
@@ -128,7 +136,7 @@ export class OutboxMessage {
       return;
     }
     this._status = OutboxStatus.Published;
-    this._publishedAt = at;
+    this._publishedAt = new Date(at.getTime());
     this._lastError = undefined;
   }
 
