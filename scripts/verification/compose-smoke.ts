@@ -95,12 +95,18 @@ async function main(): Promise<void> {
 
   const report = {
     status: 'passed',
-    apiInstances: [...instances].sort(),
-    concurrentBetStatuses: settled.map((reply) => reply.status).sort(),
-    historicalBalance: history.body.balance,
-    finalBalance: wallet.body.balance,
-    ledgerEntries: ledger.body.items.length,
-    reconciliation: reconciliation.body,
+    // Persist the assertions that passed, rather than copying network payloads
+    // into a file that another tool could later mistake for trusted input.
+    checks: [
+      'PostgreSQL and SQS readiness',
+      'nginx reaches at least three API replicas',
+      'two 80.00 bets on 100.00 settle as 201 and 422',
+      'historical replay remains 20.00 BRL after a later WIN',
+      'conflicting payload returns 409',
+      'final balance is 30.00 BRL at version 3',
+      'ledger contains exactly three entries',
+      'wallet reconciliation is consistent',
+    ],
   };
   await mkdir('reports', { recursive: true });
   await writeFile('reports/compose-smoke.json', `${JSON.stringify(report, null, 2)}\n`);
