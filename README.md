@@ -206,7 +206,7 @@ O teste `test/integration/migrations.test.ts` aplica tudo, reverte um passo, rev
 
 A imagem `runtime` das APIs e workers contém apenas dependências de produção. O job `migrations` usa o target separado `migration-runtime`, que inclui o migrator e carrega as migrations somente nesse processo. A migration `…0500` valida o histórico existente antes de instalar as novas regras e aborta atomicamente se houver corrupção; ela não apaga nem corrige lançamentos. Sua execução exige os locks normais de DDL do PostgreSQL: programe a aplicação em um banco grande. Correções, patches de dependências e validação da auditoria estão em [docs/AUDIT_FIXES.md](docs/AUDIT_FIXES.md).
 
-> Com o stack rodando, `migration:down` reverte a última migration (`…0400`, os grants), e os serviços recebem erro de permissão até o `migration:up`. Para experimentar reversões sem afetar a aplicação, prefira o teste acima, que usa um banco descartável.
+> `migration:down` reverte a última migration (`…0500`, as proteções adicionais de integridade). Reverter também `…0400` remove os grants do login runtime e impede os serviços de escrever até reaplicá-la. Para experimentar reversões sem afetar a aplicação, prefira os testes, que usam bancos descartáveis.
 
 ## 9. Endpoints (cURL)
 
@@ -418,7 +418,7 @@ docker compose --profile observability --profile tools down   # para e remove co
 docker compose up -d                                           # volta com os mesmos dados
 ```
 
-> ⚠️ `docker compose down -v` **apaga os volumes** (`pgdata`, Prometheus, Grafana): todas as wallets, transações e o ledger. Use apenas quando quiser recomeçar do zero. As suítes unitária, de integração, de concorrência e de falhas nunca tocam no banco `wagering`: cada arquivo usa um banco descartável `wagering_test_*`, removido ao final. Já o E2E, a demo e o teste de carga passam pelo stack e criam as próprias wallets no banco principal.
+> ⚠️ `docker compose down -v` **apaga os volumes** (`pgdata`, Prometheus, Grafana): todas as wallets, transações e o ledger. Use apenas quando quiser recomeçar do zero. As suítes de integração, concorrência, falhas e E2E usam bancos descartáveis `wagering_test_*` e filas próprias, removidos ao final. A demo, o teste de carga e o smoke do Compose criam dados no stack explicitamente configurado.
 
 ## 17. Variáveis de ambiente
 
@@ -458,7 +458,7 @@ Validadas na inicialização (`src/infrastructure/configuration/config.ts`): con
 | Testes falham com `ECONNREFUSED`/`Stack not ready` | suba o stack antes (`docker compose up -d --build`) e use o `toolbox`, que está nas redes internas |
 | Testes rodam código antigo | o `toolbox` copia o código no build: `docker compose --profile tools run --rm --build toolbox …` |
 | `503 DATABASE_UNAVAILABLE` / `LOCK_TIMEOUT` | condição transitória (`retryable: true`); repetir com a mesma `Idempotency-Key` é seguro |
-| Scripts quebrando após clonar no Windows | `.gitattributes` força LF; se o clone foi feito antes, `git rm --cached -r . && git reset --hard` |
+| Scripts quebrando após clonar no Windows | `.gitattributes` força LF; preserve alterações locais e confira a configuração de finais de linha. Um clone novo em outra pasta permite validar sem descartar o trabalho atual. |
 | Primeiro `up --build` demorado | download de imagens e dependências; as execuções seguintes usam o cache do BuildKit |
 
 ## 19. Limitações conhecidas
@@ -487,8 +487,9 @@ src/
 migrations/        migrations versionadas (up/down)
 infra/             docker (Dockerfile), nginx, monitoring (Prometheus, Grafana)
 test/              unit, integration, concurrency, fault-injection, e2e, support
-scripts/           demo, load-test, verification (check-money)
-docs/              TEST_REPORT.md, LOAD_TEST.md
+scripts/           demo, load-test, verification (check-money, compose-smoke)
+docs/              TEST_REPORT.md, LOAD_TEST.md, AUDIT_FIXES.md, CI_CD.md
+.github/           workflows de CI, CodeQL, publicação de imagens e Dependabot
 ```
 
 Scripts (`package.json`): `dev`, `build`, `start`, `lint`, `format`, `typecheck`, `check:money`, `test`, `test:unit`, `test:integration`, `test:concurrency`, `test:fault`, `test:e2e`, `test:load`, `migration:up|down|status`, `queues:bootstrap`, `demo`, `verify`.
