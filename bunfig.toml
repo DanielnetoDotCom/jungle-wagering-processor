@@ -1,0 +1,9 @@
+[install]
+# Reproducible installs: the lockfile is the source of truth.
+exact = true
+saveTextLockfile = true
+
+[test]
+# Domain/unit tests need no setup; integration suites build their own isolated
+# PostgreSQL database and SQS queues through test/support.
+coverageSkipTestFiles = true

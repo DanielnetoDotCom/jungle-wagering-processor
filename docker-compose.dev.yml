@@ -1,0 +1,18 @@
+# Optional override for running the services directly on the host with Bun
+# (`bun run dev`, `bun run dev:consumer`, ...): exposes PostgreSQL and
+# LocalStack on 127.0.0.1 only. Not needed for the normal Docker workflow.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres localstack migrations queue-bootstrap
+#
+# Then export the variables of the "Host development" block of .env.example.
+services:
+  postgres:
+    ports:
+      - '127.0.0.1:5432:5432'
+    # Published ports require a non-internal network.
+    networks: [backend, edge]
+
+  localstack:
+    ports:
+      - '127.0.0.1:4566:4566'
+    networks: [backend, edge]

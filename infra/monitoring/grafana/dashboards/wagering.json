@@ -1,0 +1,87 @@
+{
+  "uid": "wagering-overview",
+  "title": "Wagering Processor",
+  "tags": ["wagering"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "time": { "from": "now-30m", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "type": "timeseries", "title": "Transactions recorded / s (kind, status)",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum by (kind, status) (rate(wagering_transactions_total[1m]))", "legendFormat": "{{kind}} {{status}}" }]
+    },
+    {
+      "id": 2, "type": "timeseries", "title": "Processing latency p50 / p95 / p99 (s)",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "histogram_quantile(0.5, sum by (le) (rate(wagering_processing_duration_seconds_bucket{operation=\"process-wager\"}[1m])))", "legendFormat": "p50" },
+        { "refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(wagering_processing_duration_seconds_bucket{operation=\"process-wager\"}[1m])))", "legendFormat": "p95" },
+        { "refId": "C", "expr": "histogram_quantile(0.99, sum by (le) (rate(wagering_processing_duration_seconds_bucket{operation=\"process-wager\"}[1m])))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "Idempotency: replays, conflicts, inbox duplicates / s",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(wagering_idempotent_replays_total[1m]))", "legendFormat": "replays" },
+        { "refId": "B", "expr": "sum by (code) (rate(wagering_idempotency_conflicts_total[1m]))", "legendFormat": "conflict {{code}}" },
+        { "refId": "C", "expr": "sum(rate(wagering_inbox_duplicates_total[1m]))", "legendFormat": "inbox duplicates" }
+      ]
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "Concurrency: lock contention, retries, deadlocks, lock timeouts / s",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(wagering_wallet_lock_contention_total[1m]))", "legendFormat": "contended locks" },
+        { "refId": "B", "expr": "sum by (reason) (rate(wagering_db_retries_total[1m]))", "legendFormat": "retry {{reason}}" },
+        { "refId": "C", "expr": "sum(rate(wagering_deadlocks_total[1m]))", "legendFormat": "deadlocks" },
+        { "refId": "D", "expr": "sum(rate(wagering_lock_timeouts_total[1m]))", "legendFormat": "lock timeouts" }
+      ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Outbox: pending, lag (s), dead",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max(wagering_outbox_pending)", "legendFormat": "pending" },
+        { "refId": "B", "expr": "max(wagering_outbox_lag_seconds)", "legendFormat": "lag seconds" },
+        { "refId": "C", "expr": "max(wagering_outbox_dead)", "legendFormat": "dead" }
+      ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "SQS: received, acked, retries, dead-lettered / s and DLQ depth",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(wagering_sqs_messages_received_total[1m]))", "legendFormat": "received" },
+        { "refId": "B", "expr": "sum(rate(wagering_sqs_messages_acked_total[1m]))", "legendFormat": "acked" },
+        { "refId": "C", "expr": "sum by (reason) (rate(wagering_sqs_message_retries_total[1m]))", "legendFormat": "retry {{reason}}" },
+        { "refId": "D", "expr": "sum by (reason) (rate(wagering_sqs_messages_dead_lettered_total[1m]))", "legendFormat": "dead-lettered {{reason}}" },
+        { "refId": "E", "expr": "max(wagering_sqs_dlq_depth)", "legendFormat": "DLQ depth" }
+      ]
+    },
+    {
+      "id": 7, "type": "timeseries", "title": "Pending references: waiting, due, lag (s)",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "refId": "A", "expr": "max(wagering_pending_reference_transactions)", "legendFormat": "waiting" },
+        { "refId": "B", "expr": "max(wagering_pending_reference_due)", "legendFormat": "due" },
+        { "refId": "C", "expr": "max(wagering_pending_reference_lag_seconds)", "legendFormat": "lag seconds" }
+      ]
+    },
+    {
+      "id": 8, "type": "stat", "title": "Reconciliation divergences (total)",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [{ "refId": "A", "expr": "sum(wagering_reconciliation_inconsistencies_total) or vector(0)" }]
+    }
+  ]
+}

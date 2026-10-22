@@ -1,0 +1,6 @@
+dist
+node_modules
+coverage
+bun.lock
+infra/monitoring/grafana/dashboards/*.json
+*.md

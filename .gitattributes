@@ -1,0 +1,5 @@
+# Containers are Linux: keep LF everywhere so scripts and configs work when
+# the repository is cloned on Windows.
+* text=auto eol=lf
+*.png binary
+*.jpg binary

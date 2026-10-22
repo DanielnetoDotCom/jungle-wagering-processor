@@ -1,0 +1,61 @@
+groups:
+  - name: wagering-financial-integrity
+    rules:
+      - alert: ReconciliationDivergence
+        expr: increase(wagering_reconciliation_inconsistencies_total[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: A wallet balance does not match its ledger
+          description: Investigate the wallet reported in the RECONCILIATION_DIVERGENCE log line. Never correct it automatically.
+
+      - alert: IntegrityViolations
+        expr: increase(wagering_http_requests_total{status="500"}[5m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: Requests failing with internal errors (possible integrity rule violation)
+
+  - name: wagering-messaging
+    rules:
+      - alert: DeadLetterQueueNotEmpty
+        expr: max(wagering_sqs_dlq_depth) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Messages are waiting in the DLQ
+          description: Inspect them (docker compose exec localstack awslocal sqs receive-message ...) and redrive after fixing the cause.
+
+      - alert: OutboxLagHigh
+        expr: max(wagering_outbox_lag_seconds) > 30
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Committed events are not being published
+
+      - alert: OutboxDeadEvents
+        expr: max(wagering_outbox_dead) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: Events retained as DEAD after exhausting publication retries
+
+      - alert: PendingReferencesOverdue
+        expr: max(wagering_pending_reference_lag_seconds) > 60
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: PENDING_REFERENCE transactions are overdue (is the reference-worker running?)
+
+  - name: wagering-concurrency
+    rules:
+      - alert: WalletLockTimeouts
+        expr: sum(rate(wagering_lock_timeouts_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: Requests time out waiting for a wallet lock (hot wallet?)

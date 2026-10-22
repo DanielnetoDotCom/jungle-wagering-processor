@@ -1,0 +1,309 @@
+# Jungle Gaming - Distributed Wagering Processor
+#
+#   docker compose up -d --build
+#   docker compose up -d --build --scale api=3 --scale consumer=3 --scale outbox-worker=2
+#
+# Only nginx publishes a port (8080). Every other service lives on internal
+# networks. Default credentials are LOCAL DEVELOPMENT values; override them
+# with a .env file (see .env.example).
+
+name: jungle-wagering
+
+x-app-build: &app-build
+  context: .
+  dockerfile: infra/docker/Dockerfile
+  target: runtime
+
+x-app-environment: &app-environment
+  NODE_ENV: production
+  TZ: UTC
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  DB_HOST: postgres
+  DB_PORT: '5432'
+  DB_NAME: ${POSTGRES_DB:-wagering}
+  DB_USER: ${APP_DB_USER:-wagering_service}
+  DB_PASSWORD: ${APP_DB_PASSWORD:-local-dev-service-password}
+  DB_LOCK_TIMEOUT_MS: '5000'
+  DB_STATEMENT_TIMEOUT_MS: '15000'
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT_URL: http://localstack:4566
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  SQS_TRANSACTIONS_QUEUE: wager-transactions.fifo
+  SQS_TRANSACTIONS_DLQ: wager-transactions-dlq.fifo
+  SQS_EVENTS_QUEUE: wager-events.fifo
+  SQS_VISIBILITY_TIMEOUT_SECONDS: ${SQS_VISIBILITY_TIMEOUT_SECONDS:-30}
+  SQS_MAX_RECEIVE_COUNT: ${SQS_MAX_RECEIVE_COUNT:-5}
+  ACCEPTED_CURRENCIES: ${ACCEPTED_CURRENCIES:-BRL}
+  REFERENCE_RETRY_INITIAL_MS: ${REFERENCE_RETRY_INITIAL_MS:-2000}
+  REFERENCE_RETRY_MAX_MS: ${REFERENCE_RETRY_MAX_MS:-300000}
+  REFERENCE_MAX_ATTEMPTS: ${REFERENCE_MAX_ATTEMPTS:-10}
+  REFERENCE_TTL_MS: ${REFERENCE_TTL_MS:-3600000}
+
+x-app-service: &app-service
+  build: *app-build
+  image: jungle-wagering-processor:local
+  init: true
+  restart: unless-stopped
+  stop_grace_period: 30s
+  networks: [backend]
+
+x-app-dependencies: &app-dependencies
+  postgres:
+    condition: service_healthy
+  localstack:
+    condition: service_healthy
+  migrations:
+    condition: service_completed_successfully
+  queue-bootstrap:
+    condition: service_completed_successfully
+
+x-worker-healthcheck: &worker-healthcheck
+  test:
+    [
+      'CMD',
+      'bun',
+      '-e',
+      "fetch('http://127.0.0.1:9100/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+    ]
+  interval: 5s
+  timeout: 4s
+  retries: 12
+  start_period: 10s
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-wagering}
+      POSTGRES_USER: ${POSTGRES_OWNER_USER:-wagering_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-local-dev-owner-password}
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+      - -c
+      - timezone=UTC
+      - -c
+      - log_timezone=UTC
+      - -c
+      - shared_buffers=256MB
+      - -c
+      - deadlock_timeout=1s
+      - -c
+      - log_lock_waits=on
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks: [backend]
+    restart: unless-stopped
+
+  localstack:
+    image: ${LOCALSTACK_IMAGE:-localstack/localstack:4.14.0}
+    environment:
+      SERVICES: sqs
+      SQS_ENDPOINT_STRATEGY: path
+      LOCALSTACK_HOST: localstack:4566
+      DISABLE_EVENTS: '1'
+      LOCALSTACK_AUTH_TOKEN: ${LOCALSTACK_AUTH_TOKEN:-}
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'curl -fsS http://localhost:4566/_localstack/health | grep -Eq ''"sqs": "(available|running)"''',
+        ]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+    networks: [backend]
+    restart: unless-stopped
+
+  # One-shot job: versioned migrations (schema owner) + runtime login provisioning.
+  migrations:
+    <<: *app-service
+    command: ['bun', 'dist/src/entrypoints/migrate.js', 'up']
+    restart: 'no'
+    environment:
+      <<: *app-environment
+      DB_USER: ${POSTGRES_OWNER_USER:-wagering_owner}
+      DB_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-local-dev-owner-password}
+      DB_APP_USER: ${APP_DB_USER:-wagering_service}
+      DB_APP_PASSWORD: ${APP_DB_PASSWORD:-local-dev-service-password}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # One-shot job: idempotent creation of the FIFO queues and DLQ.
+  queue-bootstrap:
+    <<: *app-service
+    command: ['bun', 'dist/src/entrypoints/bootstrap-queues.js']
+    restart: 'no'
+    environment:
+      <<: *app-environment
+    depends_on:
+      localstack:
+        condition: service_healthy
+
+  api:
+    <<: *app-service
+    command: ['bun', 'dist/src/entrypoints/api.js']
+    deploy:
+      replicas: 3
+    environment:
+      <<: *app-environment
+      HTTP_PORT: '3000'
+      DB_POOL_MAX: '10'
+    expose: ['3000']
+    networks: [edge, backend]
+    depends_on: *app-dependencies
+    healthcheck:
+      test:
+        [
+          'CMD',
+          'bun',
+          '-e',
+          "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 4s
+      retries: 12
+      start_period: 10s
+
+  consumer:
+    <<: *app-service
+    command: ['bun', 'dist/src/entrypoints/consumer.js']
+    deploy:
+      replicas: 3
+    environment:
+      <<: *app-environment
+      METRICS_PORT: '9100'
+      DB_POOL_MAX: '5'
+    expose: ['9100']
+    depends_on: *app-dependencies
+    healthcheck: *worker-healthcheck
+
+  outbox-worker:
+    <<: *app-service
+    command: ['bun', 'dist/src/entrypoints/outbox-worker.js']
+    deploy:
+      replicas: 2
+    environment:
+      <<: *app-environment
+      METRICS_PORT: '9100'
+      DB_POOL_MAX: '3'
+    expose: ['9100']
+    depends_on: *app-dependencies
+    healthcheck: *worker-healthcheck
+
+  reference-worker:
+    <<: *app-service
+    command: ['bun', 'dist/src/entrypoints/reference-worker.js']
+    deploy:
+      replicas: 1
+    environment:
+      <<: *app-environment
+      METRICS_PORT: '9100'
+      DB_POOL_MAX: '3'
+    expose: ['9100']
+    depends_on: *app-dependencies
+    healthcheck: *worker-healthcheck
+
+  nginx:
+    image: nginx:1.28-alpine
+    ports:
+      # Default 8080; override with API_PUBLIC_PORT if the host port is taken.
+      - '${API_PUBLIC_PORT:-8080}:8080'
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://127.0.0.1:8080/nginx-health']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks: [edge]
+    restart: unless-stopped
+
+  # Tests, lint and demo tooling without installing Bun on the host:
+  #   docker compose --profile tools run --rm toolbox bun run test
+  toolbox:
+    build:
+      context: .
+      dockerfile: infra/docker/Dockerfile
+      target: dev
+    image: jungle-wagering-processor:dev
+    profiles: [tools]
+    init: true
+    environment:
+      # Same settings as the services, so `bun run dev|start|migration:*|demo` work here too.
+      <<: *app-environment
+      NODE_ENV: test
+      LOG_LEVEL: ${TEST_LOG_LEVEL:-silent}
+      DB_MIGRATION_USER: ${POSTGRES_OWNER_USER:-wagering_owner}
+      DB_MIGRATION_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-local-dev-owner-password}
+      DEMO_BASE_URL: http://nginx:8080
+      TEST_DB_HOST: postgres
+      TEST_DB_PORT: '5432'
+      TEST_DB_ADMIN_USER: ${POSTGRES_OWNER_USER:-wagering_owner}
+      TEST_DB_ADMIN_PASSWORD: ${POSTGRES_OWNER_PASSWORD:-local-dev-owner-password}
+      TEST_DB_ADMIN_DATABASE: ${POSTGRES_DB:-wagering}
+      E2E_BASE_URL: http://nginx:8080
+      E2E_DB_NAME: ${POSTGRES_DB:-wagering}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    networks: [backend, edge]
+
+  prometheus:
+    image: prom/prometheus:v3.13.5
+    profiles: [observability]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=7d
+    volumes:
+      - ./infra/monitoring/prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+    ports:
+      - '127.0.0.1:9090:9090'
+    networks: [backend, monitoring]
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:13.0.11
+    profiles: [observability]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-local-dev-grafana}
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    volumes:
+      - ./infra/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - '127.0.0.1:3001:3000'
+    depends_on: [prometheus]
+    networks: [monitoring]
+    restart: unless-stopped
+
+networks:
+  # Public side: nginx and the API replicas.
+  edge: {}
+  # Private side: databases, broker, workers. No route to the outside world.
+  backend:
+    internal: true
+  monitoring: {}
+
+volumes:
+  pgdata:
+  prometheus-data:
+  grafana-data:
