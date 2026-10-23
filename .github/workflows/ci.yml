@@ -148,8 +148,22 @@ jobs:
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
           bun-version: 1.4.3
-      - name: Build and start the full stack
-        run: docker compose -p "$COMPOSE_PROJECT_NAME" up -d --build --wait --wait-timeout 240
+      # Docker Hub occasionally times out on token/manifest requests from hosted
+      # runners; retry registry-bound steps so a transient outage is not a red build.
+      - name: Pull registry images and build local images
+        run: |
+          retry() {
+            for attempt in 1 2 3 4; do
+              "$@" && return 0
+              echo "::warning::'$*' failed (attempt $attempt); retrying"
+              sleep $((attempt * 15))
+            done
+            return 1
+          }
+          retry docker compose -p "$COMPOSE_PROJECT_NAME" pull --ignore-buildable --quiet
+          retry docker compose -p "$COMPOSE_PROJECT_NAME" build
+      - name: Start the full stack
+        run: docker compose -p "$COMPOSE_PROJECT_NAME" up -d --no-build --wait --wait-timeout 240
       - name: Verify nginx, three replicas and financial invariants
         run: bun scripts/verification/compose-smoke.ts
       - name: Collect Compose diagnostics
