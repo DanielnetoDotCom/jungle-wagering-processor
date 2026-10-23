@@ -16,6 +16,7 @@ import { PrometheusMetrics } from '../../infrastructure/metrics/prometheus-metri
 import {
   NoopProviderIdentityResolver,
   PROVIDER_IDENTITY_RESOLVER,
+  type ProviderIdentityResolver,
   ProviderAuthGuard,
 } from '../../interfaces/http/auth/provider-identity';
 import { INSTANCE_INFO, OperationsController } from '../../interfaces/http/controllers/operations.controller';
@@ -90,15 +91,15 @@ export class CoreModule {
 /** HTTP API process: REST endpoints + health + metrics. No background workers here. */
 @Module({})
 export class ApiModule {
-  static register(core: Core): DynamicModule {
+  static register(
+    core: Core,
+    identity: ProviderIdentityResolver = new NoopProviderIdentityResolver(),
+  ): DynamicModule {
     return {
       module: ApiModule,
       imports: [CoreModule.register(core)],
       controllers: [WalletsController, WageringController, OperationsController],
-      providers: [
-        ProviderAuthGuard,
-        { provide: PROVIDER_IDENTITY_RESOLVER, useValue: new NoopProviderIdentityResolver() },
-      ],
+      providers: [ProviderAuthGuard, { provide: PROVIDER_IDENTITY_RESOLVER, useValue: identity }],
     };
   }
 }

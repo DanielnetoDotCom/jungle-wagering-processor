@@ -3,6 +3,7 @@ import {
   ApplicationError,
   IntegrityViolationError,
   TransientInfrastructureError,
+  UnexpectedDatabaseError,
   UniqueConstraintRaceError,
 } from '../../../application/errors/application-errors';
 import { DomainError } from '../../../domain/errors/domain-errors';
@@ -33,6 +34,8 @@ const INTEGRITY_CODES = new Set([
   'P0001', // raise_exception
 ]);
 
+const SQLSTATE = /^[0-9A-Z]{5}$/;
+
 const UNAVAILABLE_MESSAGE =
   /Connection terminated|connect ECONNREFUSED|Timeout acquiring a connection|Client has encountered a connection error|Connection ended unexpectedly|terminating connection|not currently accepting connections|the database system is (starting up|shutting down)/i;
 
@@ -42,6 +45,9 @@ const UNAVAILABLE_MESSAGE =
  *  - deadlock / serialization / lock timeout / lost unique race -> transient, retry the unit of work
  *  - connection problems                                       -> transient, surface (503 / SQS retry)
  *  - CHECK / FK / trigger violations                           -> integrity violation (a bug), never retried
+ *  - any other SQLSTATE                                        -> unexpected database error
+ * The translated messages never include the driver's text, which quotes SQL
+ * bindings and row values.
  */
 export function translateDatabaseError(error: unknown): unknown {
   if (error instanceof ApplicationError || error instanceof DomainError || !(error instanceof Error)) {
@@ -80,9 +86,11 @@ export function translateDatabaseError(error: unknown): unknown {
       break;
   }
   if (code !== undefined && INTEGRITY_CODES.has(code)) {
+    // Only the SQLSTATE and the constraint name: the driver message quotes the
+    // SQL bindings and the failing row (player ids, amounts, keys).
     return new IntegrityViolationError(
       constraint,
-      `Database integrity rule rejected the write: ${error.message}`,
+      `Database integrity rule rejected the write (SQLSTATE ${code}${constraint ? `, constraint ${constraint}` : ''})`,
       error,
     );
   }
@@ -98,6 +106,9 @@ export function translateDatabaseError(error: unknown): unknown {
       undefined,
       error,
     );
+  }
+  if (code !== undefined && SQLSTATE.test(code)) {
+    return new UnexpectedDatabaseError(code, error);
   }
   return error;
 }

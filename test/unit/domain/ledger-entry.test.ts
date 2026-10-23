@@ -92,4 +92,23 @@ describe('WalletLedgerEntry', () => {
       (entry as unknown as { balanceAfter: Money }).balanceAfter = brl('999.00');
     }).toThrow();
   });
+
+  test('rehydrate rebuilds a persisted line as is (its arithmetic was proven at creation and by the database)', () => {
+    const state = {
+      ...base,
+      direction: LedgerDirection.Debit,
+      money: brl('5.00'),
+      balanceBefore: brl('20.00'),
+      balanceAfter: brl('15.00'),
+    };
+    const entry = WalletLedgerEntry.rehydrate(state);
+    expect(entry.isBalanced()).toBe(true);
+    expect(entry.signedAmount().amount).toBe('-5.00');
+    expect(entry.createdAt).toEqual(base.createdAt);
+    expect(Object.isFrozen(entry)).toBe(true);
+    // No validation re-runs on load: create() would refuse this line, rehydrate() does not.
+    const unbalanced = { ...state, balanceAfter: brl('14.00') };
+    expect(() => WalletLedgerEntry.create(unbalanced)).toThrow(InvariantViolationError);
+    expect(WalletLedgerEntry.rehydrate(unbalanced).isBalanced()).toBe(false);
+  });
 });

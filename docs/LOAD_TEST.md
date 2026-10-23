@@ -1,113 +1,113 @@
-# Teste de carga
+# Load test
 
-> Números medidos, não estimados. Os relatórios JSON brutos ficam em `reports/` (ignorado pelo Git) e são regenerados a cada execução. Não há meta de RPS: o objetivo é mostrar como o sistema se comporta sob concorrência real e se as invariantes financeiras continuam válidas no fim.
+> Measured numbers, not estimates. The raw JSON reports live in `reports/` (ignored by Git) and are regenerated on every run. There is no RPS target: the goal is to show how the system behaves under real concurrency and whether the financial invariants still hold at the end.
 
-## Ambiente
+## Environment
 
-| Item | Valor |
+| Item | Value |
 |---|---|
-| Host | Windows 11 Pro, Intel Core i5-12400 (6 núcleos / 12 threads), 31,8 GB RAM |
-| Docker | Docker Desktop 29.7.2 (backend WSL2, kernel 6.6.87.2), 12 vCPUs e 15,5 GB disponíveis para os containers |
-| Topologia | `docker compose up -d --build`: nginx + **3 api** + **3 consumer** + **2 outbox-worker** + 1 reference-worker + PostgreSQL 17 + LocalStack 4.14 (SQS) |
-| Runtime | Bun 1.4.3, código compilado (`tsc`), `NODE_ENV=production` |
-| Pools PostgreSQL | api 10 conexões × 3, consumer 5 × 3, outbox 3 × 2, reference 3 (54 no total) |
-| Gerador de carga | `toolbox` (mesmo host, rede Docker interna), cliente `fetch` do Bun com keep-alive |
+| Host | Windows 11 Pro, Intel Core i5-12400 (6 cores / 12 threads), 31.8 GB RAM |
+| Docker | Docker Desktop 29.7.2 (WSL2 backend, kernel 6.6.87.2), 12 vCPUs and 15.5 GB available to the containers |
+| Topology | `docker compose up -d --build`: nginx + **3 api** + **3 consumer** + **2 outbox-worker** + 1 reference-worker + PostgreSQL 17 + LocalStack 4.14 (SQS) |
+| Runtime | Bun 1.4.3, compiled code (`tsc`), `NODE_ENV=production` |
+| PostgreSQL pools | api 10 connections × 3, consumer 5 × 3, outbox 3 × 2, reference 3 (54 total) |
+| Load generator | `toolbox` (same host, internal Docker network), Bun `fetch` client with keep-alive |
 
-Todos os componentes, inclusive o gerador de carga, disputam a mesma CPU. É um ambiente de desenvolvimento, não um benchmark de produção (ver "Limitações do experimento").
+All components, including the load generator, compete for the same CPU. This is a development environment, not a production benchmark (see "Experiment limitations").
 
-As execuções aconteceram antes das correções finais da revisão de código ([TEST_REPORT.md](TEST_REPORT.md), itens 5 a 9): pausa do consumidor em queda do banco, correlation id limitado, normalização de UUID, inbox de mensagem nunca processada e timestamps monotônicos. Nenhuma delas atua no caminho medido sem falhas, e por isso os números continuam representativos. Para remedir: `bun run test:load`.
+The runs took place before the final code review fixes ([TEST_REPORT.md](TEST_REPORT.md), items 5 to 9): consumer pause during a database outage, bounded correlation id, UUID normalization, inbox for a never-processed message, and monotonic timestamps. None of them acts on the measured failure-free path, so the numbers remain representative. To re-measure: `bun run test:load`.
 
-## Metodologia
+## Methodology
 
-Comando (reprodutível):
+Command (reproducible):
 
 ```bash
 docker compose up -d --build
 docker compose --profile tools run --rm toolbox bun run test:load
-# variações por variáveis de ambiente, por exemplo:
+# variations via environment variables, for example:
 docker compose --profile tools run --rm -e LOAD_HOT_WALLET_SHARE=0 toolbox bun run test:load
 ```
 
 Script: [`scripts/load-test/load-test.ts`](../scripts/load-test/load-test.ts).
 
-1. **Preparação**: cria 200 wallets com saldo 100.000,00 BRL e 1 *hot wallet* com 1.000.000,00 BRL (saldo alto para que nenhuma aposta seja rejeitada por falta de saldo e o resultado esperado seja determinístico).
-2. **Carga por 60s, simultaneamente**:
-   - **HTTP**: 32 usuários virtuais em laço fechado contra o nginx (porta 8080 → 3 réplicas). Cada iteração é BET (60%) ou WIN (40%) de 1,00 a 19,99 BRL. Por padrão 15% das operações vão para a hot wallet e 10% são **reenvios idênticos** de requisições anteriores (mesma `Idempotency-Key`, mesmo payload).
-   - **SQS**: produtor enviando ~50 msg/s para `wager-transactions.fifo` (`MessageGroupId` = walletId). Cerca de 10% das mensagens são **entregues duas vezes** (mesmo `messageId`, `MessageDeduplicationId` diferente), forçando a deduplicação pelo inbox.
-3. **Drenagem**: espera o outbox ficar sem eventos `PENDING`, não restar `PENDING_REFERENCE` e o inbox registrar todas as mensagens únicas.
-4. **Coleta**:
-   - latência HTTP (p50/p95/p99/máx) medida no cliente;
-   - latência SQS ponta a ponta: envio pelo produtor → `created_at` da transação gravada pelo consumidor;
-   - lag do outbox: `published_at − occurred_at` de cada evento (percentis calculados no PostgreSQL);
-   - contadores Prometheus somados em **todas** as réplicas (DNS do Docker → um IP por réplica): contenção de lock, retries, deadlocks, lock timeouts, replays e duplicatas do inbox.
-5. **Verificação final**: `POST /wallets/:id/reconciliation` para **todas** as 201 wallets, mais a checagem de saldos negativos no banco.
+1. **Setup**: creates 200 wallets with a balance of 100,000.00 BRL and 1 *hot wallet* with 1,000,000.00 BRL (a high balance so that no bet is rejected for insufficient funds and the expected result is deterministic).
+2. **Load for 60s, simultaneously**:
+   - **HTTP**: 32 virtual users in a closed loop against nginx (port 8080 → 3 replicas). Each iteration is a BET (60%) or WIN (40%) of 1.00 to 19.99 BRL. By default 15% of operations go to the hot wallet and 10% are **identical resends** of earlier requests (same `Idempotency-Key`, same payload).
+   - **SQS**: a producer sending ~50 msg/s to `wager-transactions.fifo` (`MessageGroupId` = walletId). About 10% of messages are **delivered twice** (same `messageId`, different `MessageDeduplicationId`), forcing deduplication by the inbox.
+3. **Drain**: waits until the outbox has no `PENDING` events, no `PENDING_REFERENCE` remains, and the inbox has recorded every unique message.
+4. **Collection**:
+   - HTTP latency (p50/p95/p99/max) measured on the client;
+   - end-to-end SQS latency: send by the producer → `created_at` of the transaction written by the consumer;
+   - outbox lag: `published_at − occurred_at` for each event (percentiles computed in PostgreSQL);
+   - Prometheus counters summed across **all** replicas (Docker DNS → one IP per replica): lock contention, retries, deadlocks, lock timeouts, replays and inbox duplicates.
+5. **Final verification**: `POST /wallets/:id/reconciliation` for **all** 201 wallets, plus a check for negative balances in the database.
 
-## Resultados
+## Results
 
-Três execuções de 60s com os mesmos parâmetros, exceto o indicado:
+Three 60s runs with the same parameters, except where noted:
 
-| Métrica | A: hot 15% (antes do ajuste de timestamp) | **B: hot 15% (versão final)** | C: sem hot wallet |
+| Metric | A: hot 15% (before the timestamp fix) | **B: hot 15% (final version)** | C: no hot wallet |
 |---|---|---|---|
-| Requisições HTTP | 17.191 | **15.808** | 20.288 |
-| Throughput HTTP | 285,2 req/s | **262,2 req/s** | 337,6 req/s |
-| Latência HTTP p50 / p95 / p99 | 42 / 551 / 767 ms | **48 / 616 / 863 ms** | 86 / 184 / 239 ms |
-| Latência HTTP máxima | 1.797 ms | **1.867 ms** | 403 ms |
-| Hot wallet p50 / p95 / p99 | 488 / 803 / 1.125 ms | **535 / 903 / 1.117 ms** | — |
-| Operações na hot wallet | 2.367 | **2.098** | 0 |
-| Status HTTP | 201: 15.509, 200: 1.682 | **201: 14.118, 200: 1.690** | 201: 18.314, 200: 1.974 |
-| Taxa de erro (5xx / rede) | 0% | **0%** | 0% |
-| Mensagens SQS enviadas (duplicatas) | 2.760 (221) | **2.740 (242)** | 2.670 (213) |
-| SQS ponta a ponta p50 / p95 / p99 | 32 / 119 / 224 ms | **46 / 160 / 420 ms** | 52 / 146 / 240 ms |
-| Lag do outbox p50 / p95 / p99 / máx | 97 / 571 / 802 / 1.915 ms | **90 / 219 / 421 / 587 ms** | 165 / 506 / 826 / 1.021 ms |
-| Eventos publicados | 36.096 | **33.232** | 41.542 |
-| Esperas por lock de wallet (contenção) | 3.097 | **2.867** | 2.126 |
-| Retries de transação / deadlocks / lock timeouts | 0 / 0 / 0 | **0 / 0 / 0** | 0 / 0 / 0 |
-| Replays idempotentes (HTTP) | 1.682 | **1.690** | 1.974 |
-| Duplicatas absorvidas pelo inbox | 221 | **242** | 213 |
-| Retries SQS / mensagens na DLQ | 0 / 0 | **0 / 0** | 0 / 0 |
-| Wallets reconciliadas / inconsistentes | 201 / 0 | **201 / 0** | 201 / 0 |
-| Saldos negativos | 0 | **0** | 0 |
+| HTTP requests | 17,191 | **15,808** | 20,288 |
+| HTTP throughput | 285.2 req/s | **262.2 req/s** | 337.6 req/s |
+| HTTP latency p50 / p95 / p99 | 42 / 551 / 767 ms | **48 / 616 / 863 ms** | 86 / 184 / 239 ms |
+| Max HTTP latency | 1,797 ms | **1,867 ms** | 403 ms |
+| Hot wallet p50 / p95 / p99 | 488 / 803 / 1,125 ms | **535 / 903 / 1,117 ms** | — |
+| Operations on the hot wallet | 2,367 | **2,098** | 0 |
+| HTTP status | 201: 15,509, 200: 1,682 | **201: 14,118, 200: 1,690** | 201: 18,314, 200: 1,974 |
+| Error rate (5xx / network) | 0% | **0%** | 0% |
+| SQS messages sent (duplicates) | 2,760 (221) | **2,740 (242)** | 2,670 (213) |
+| SQS end-to-end p50 / p95 / p99 | 32 / 119 / 224 ms | **46 / 160 / 420 ms** | 52 / 146 / 240 ms |
+| Outbox lag p50 / p95 / p99 / max | 97 / 571 / 802 / 1,915 ms | **90 / 219 / 421 / 587 ms** | 165 / 506 / 826 / 1,021 ms |
+| Events published | 36,096 | **33,232** | 41,542 |
+| Wallet lock waits (contention) | 3,097 | **2,867** | 2,126 |
+| Transaction retries / deadlocks / lock timeouts | 0 / 0 / 0 | **0 / 0 / 0** | 0 / 0 / 0 |
+| Idempotent replays (HTTP) | 1,682 | **1,690** | 1,974 |
+| Duplicates absorbed by the inbox | 221 | **242** | 213 |
+| SQS retries / messages in the DLQ | 0 / 0 | **0 / 0** | 0 / 0 |
+| Wallets reconciled / inconsistent | 201 / 0 | **201 / 0** | 201 / 0 |
+| Negative balances | 0 | **0** | 0 |
 
-Em todas as execuções:
+In every run:
 
-- **Nenhuma divergência** entre saldo materializado e ledger, em 201 wallets.
-- Cada replay HTTP respondeu `200` com o resultado original. O número de replays medido pelo servidor é **exatamente** igual ao de reenvios do cliente (1.690 = 1.690 na execução B).
-- Cada duplicata SQS foi absorvida pelo inbox: 242 enviadas, 242 contadas em `wagering_inbox_duplicates_total`.
-- A versão final da hot wallet é igual ao número de operações aplicadas mais o OPENING (2.099 = 2.098 + 1): nenhuma operação foi aplicada duas vezes.
+- **No divergence** between the materialized balance and the ledger, across 201 wallets.
+- Every HTTP replay returned `200` with the original result. The number of replays measured by the server is **exactly** equal to the number of client resends (1,690 = 1,690 in run B).
+- Every SQS duplicate was absorbed by the inbox: 242 sent, 242 counted in `wagering_inbox_duplicates_total`.
+- The final version of the hot wallet equals the number of applied operations plus the OPENING (2,099 = 2,098 + 1): no operation was applied twice.
 
-## Análise
+## Analysis
 
-### 1. Hot wallet: o custo do lock pessimista é localizado e mensurável
+### 1. Hot wallet: the cost of pessimistic locking is localized and measurable
 
-Toda alteração de uma wallet é serializada pelo `SELECT … FOR UPDATE` da sua linha. Com ~15% de 32 usuários virtuais (~5 em média) disputando a mesma wallet, cada requisição espera, em mediana, que as anteriores façam commit (p50 de 535ms na hot wallet). Isso é o comportamento desejado: correção antes de throughput. O efeito colateral aparece na comparação B × C:
+Every change to a wallet is serialized by `SELECT … FOR UPDATE` on its row. With ~15% of 32 virtual users (~5 on average) contending for the same wallet, each request waits, at the median, for the previous ones to commit (p50 of 535ms on the hot wallet). This is the intended behavior: correctness before throughput. The side effect shows up in the B vs. C comparison:
 
-- Sem hot wallet, o p95 geral cai de 616ms para 184ms e o p99 de 863ms para 239ms.
-- A causa é que **quem espera o lock segura uma conexão do pool** enquanto espera. As requisições da hot wallet ocupam parte das 30 conexões das APIs, e requisições de outras wallets passam a esperar por conexão. A hot wallet não bloqueia as outras wallets no banco (não há lock global; o teste `different wallets never block each other` comprova isso), mas compete com elas por um recurso compartilhado do processo.
-- O p50 menor na execução B (48ms × 86ms em C) não indica que B seja mais rápida. Em B parte dos usuários fica "estacionada" na hot wallet, e os demais encontram o banco menos ocupado.
+- Without the hot wallet, the overall p95 drops from 616ms to 184ms and the p99 from 863ms to 239ms.
+- The cause is that **whoever waits for the lock holds a pool connection** while waiting. Hot wallet requests occupy part of the APIs' 30 connections, and requests for other wallets end up waiting for a connection. The hot wallet does not block other wallets in the database (there is no global lock; the `different wallets never block each other` test proves it), but it competes with them for a shared process resource.
+- The lower p50 in run B (48ms vs. 86ms in C) does not mean B is faster. In B some users are "parked" on the hot wallet, and the rest find the database less busy.
 
-Mitigações possíveis, não implementadas porque não melhoram a correção: (a) fila em memória por wallet dentro de cada instância (*single-flight*), que reduz conexões ociosas sem substituir o lock do banco; (b) pool dedicado ou `lock_timeout` menor para wallets reconhecidamente quentes, devolvendo `503 LOCK_TIMEOUT` (retryable) mais cedo; (c) particionar o saldo de wallets institucionais em sub-wallets. Ver ADR-005 no [ARCHITECTURE.md](../ARCHITECTURE.md).
+Possible mitigations, not implemented because they do not improve correctness: (a) an in-memory per-wallet queue inside each instance (*single-flight*), which reduces idle connections without replacing the database lock; (b) a dedicated pool or a lower `lock_timeout` for known hot wallets, returning `503 LOCK_TIMEOUT` (retryable) sooner; (c) partitioning the balance of institutional wallets into sub-wallets. See ADR-005 in [ARCHITECTURE.md](../ARCHITECTURE.md).
 
-### 2. Nenhum retry, deadlock ou lock timeout
+### 2. No retries, deadlocks or lock timeouts
 
-Com uma única wallet por operação e ordem de locks fixa (wallet → transação → demais linhas), deadlocks não ocorreram sob carga. A recuperação de deadlock é testada à parte, de forma determinística (`test/concurrency/locks-and-deadlocks.test.ts`). O `lock_timeout` de 5s nunca foi atingido; a maior latência HTTP observada, que inclui a espera pelo lock, foi de cerca de 1,9s.
+With a single wallet per operation and a fixed lock order (wallet → transaction → other rows), no deadlocks occurred under load. Deadlock recovery is tested separately and deterministically (`test/concurrency/locks-and-deadlocks.test.ts`). The 5s `lock_timeout` was never reached; the highest observed HTTP latency, which includes waiting for the lock, was about 1.9s.
 
-### 3. Lag do outbox e um ajuste feito por causa deste teste
+### 3. Outbox lag and a fix made because of this test
 
-Na execução A, o lag do outbox (p95 571ms) acompanhava a latência HTTP. A investigação mostrou que o instante da operação (`occurred_at`, `processed_at`, `created_at` do ledger) era capturado **antes** de adquirir o lock da wallet, e portanto incluía o tempo de espera. Além de distorcer o lag, isso permitia que a versão N+1 de uma wallet tivesse timestamp anterior ao da versão N.
+In run A, the outbox lag (p95 571ms) tracked the HTTP latency. Investigation showed that the operation instant (`occurred_at`, `processed_at`, the ledger's `created_at`) was captured **before** acquiring the wallet lock, and therefore included the wait time. Besides skewing the lag, this allowed version N+1 of a wallet to have an earlier timestamp than version N.
 
-A correção passou a capturar o instante **depois** do lock (`process-wager-transaction.use-case.ts` e `resolve-pending-reference.use-case.ts`). Também acrescentei a toda a suíte de testes a verificação de que `created_at` do ledger é não-decrescente por versão. Na execução B, o lag passou a medir de fato commit → publicação: p95 219ms, máximo 587ms.
+The fix now captures the instant **after** the lock (`process-wager-transaction.use-case.ts` and `resolve-pending-reference.use-case.ts`). I also added to the whole test suite a check that the ledger's `created_at` is non-decreasing by version. In run B, the lag now actually measures commit → publish: p95 219ms, max 587ms.
 
-Na execução C (mais eventos por segundo: 692/s contra 554/s em B) o lag sobe novamente (p95 506ms). Isso indica que 2 publishers com lote de 50 eventos e envio sequencial dos `SendMessageBatch` estão perto da capacidade neste ambiente. É ajustável com `OUTBOX_BATCH_SIZE`, `OUTBOX_POLL_INTERVAL_MS` e réplicas de `outbox-worker` (o claim com `SKIP LOCKED` escala horizontalmente).
+In run C (more events per second: 692/s vs. 554/s in B) the lag rises again (p95 506ms). This indicates that 2 publishers with batches of 50 events and sequential `SendMessageBatch` sends are close to capacity in this environment. It is tunable via `OUTBOX_BATCH_SIZE`, `OUTBOX_POLL_INTERVAL_MS` and `outbox-worker` replicas (the `SKIP LOCKED` claim scales horizontally).
 
 ### 4. SQS
 
-Os consumidores acompanharam os ~46 msg/s sem fila acumulada (drenagem ≤ 1s após o fim da carga), com p95 ponta a ponta de 146 a 160ms. Não houve retries nem DLQ.
+The consumers kept up with ~46 msg/s with no queue buildup (drain ≤ 1s after the load ended), with an end-to-end p95 of 146 to 160ms. There were no retries and no DLQ messages.
 
-## Limitações do experimento
+## Experiment limitations
 
-- Um único host executa todos os componentes **e** o gerador de carga: os números refletem disputa de CPU entre eles, não o limite de nenhum componente isolado.
-- Docker Desktop no Windows (WSL2) adiciona latência de rede virtual entre containers. Em Linux nativo os números tendem a ser melhores.
-- LocalStack não reproduz latência, limites nem throttling do SQS real.
-- PostgreSQL com configuração padrão (exceto `max_connections=200`, `shared_buffers=256MB`), em volume Docker.
-- Execuções de 60s não mostram efeitos de longo prazo (crescimento de tabelas, autovacuum, retenção do outbox/inbox).
-- Carga em laço fechado: a taxa de chegada se ajusta à latência e não testa sobrecarga por taxa fixa (*open model*).
+- A single host runs all the components **and** the load generator: the numbers reflect CPU contention among them, not the limit of any isolated component.
+- Docker Desktop on Windows (WSL2) adds virtual network latency between containers. On native Linux the numbers tend to be better.
+- LocalStack does not reproduce the latency, limits or throttling of real SQS.
+- PostgreSQL with the default configuration (except `max_connections=200`, `shared_buffers=256MB`), on a Docker volume.
+- 60s runs do not show long-term effects (table growth, autovacuum, outbox/inbox retention).
+- Closed-loop load: the arrival rate adapts to latency and does not test overload at a fixed rate (*open model*).

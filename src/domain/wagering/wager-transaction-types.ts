@@ -29,6 +29,13 @@ export enum TransactionChannel {
 }
 
 /**
+ * Provider id of internal (system-generated) transactions such as OPENING.
+ * Reserved: providers can never submit under it, so their idempotency keys
+ * and external ids never share a namespace with the system's.
+ */
+export const INTERNAL_PROVIDER_ID = 'internal';
+
+/**
  * Stable, machine-readable failure taxonomy persisted with REJECTED/FAILED
  * transactions. Providers must branch on these codes, never on messages.
  * Adding a code is backwards compatible; renaming one is a breaking change.

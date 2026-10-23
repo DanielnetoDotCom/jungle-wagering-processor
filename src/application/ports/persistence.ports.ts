@@ -105,6 +105,14 @@ export interface OutboxBacklog {
   oldestPendingSeconds: number;
 }
 
+export interface RetiredOutboxEvent {
+  id: string;
+  eventType: string;
+  aggregateId: string;
+  correlationId: string;
+  attempts: number;
+}
+
 export interface OutboxRepository {
   add(message: OutboxMessage): void;
   /** Claims due events (FOR UPDATE SKIP LOCKED), stamps a lease and increments attempts. */
@@ -114,6 +122,13 @@ export interface OutboxRepository {
     leaseUntil: Date;
     limit: number;
   }): Promise<OutboxMessage[]>;
+  /**
+   * Retains as DEAD the events whose attempts are exhausted and whose last
+   * claim was abandoned (lease expired without a recorded outcome), so a
+   * publication that keeps killing its worker is not republished forever.
+   * An event requeued by an operator has no lease and gets a new attempt.
+   */
+  retireAbandoned(params: { now: Date; maxAttempts: number }): Promise<RetiredOutboxEvent[]>;
   /** Marks events as published. Idempotent; does not require the lease (publication already happened). */
   markPublished(ids: readonly string[], at: Date): Promise<number>;
   /** Persists a retry/dead decision, only if `workerId` still owns the lease. */

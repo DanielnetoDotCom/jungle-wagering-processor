@@ -54,13 +54,15 @@ export class ProviderAuthGuard implements CanActivate {
   }
 }
 
+/** Whether the authenticated caller may act for (or read the data of) this provider. */
+export function canActFor(request: Request, providerId: string): boolean {
+  const identity = (request as RequestWithIdentity).providerIdentity;
+  return identity !== undefined && (identity.providers === '*' || identity.providers.includes(providerId));
+}
+
 /** The provider identity carried in the payload must match the authenticated caller. */
 export function assertCanActFor(request: Request, providerId: string): void {
-  const identity = (request as RequestWithIdentity).providerIdentity;
-  if (!identity) {
-    throw new ProviderForbiddenError(providerId);
-  }
-  if (identity.providers !== '*' && !identity.providers.includes(providerId)) {
+  if (!canActFor(request, providerId)) {
     throw new ProviderForbiddenError(providerId);
   }
 }

@@ -73,9 +73,17 @@ export async function expectWalletConsistent(db: TestDatabase, walletId: string)
   return audit;
 }
 
-/** Final check of a suite: every wallet of the database is consistent. */
-export async function expectAllWalletsConsistent(db: TestDatabase): Promise<number> {
-  const wallets = await db.query<{ id: string }>('SELECT id FROM wallets');
+/**
+ * Final check of a suite: every wallet of the database is consistent, except
+ * those a test corrupted on purpose (they must be listed explicitly).
+ */
+export async function expectAllWalletsConsistent(
+  db: TestDatabase,
+  options: { except?: ReadonlySet<string> } = {},
+): Promise<number> {
+  const wallets = (await db.query<{ id: string }>('SELECT id FROM wallets')).filter(
+    (wallet) => !options.except?.has(wallet.id),
+  );
   for (const wallet of wallets) {
     await expectWalletConsistent(db, wallet.id);
   }

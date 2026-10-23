@@ -53,6 +53,8 @@ export function mikroOrmOptions(database: AppConfig['database'], options: OrmOpt
     },
     driverOptions: {
       acquireConnectionTimeout: database.acquireTimeoutMs,
+      // Keep SQL bindings (player ids, amounts, keys) out of error messages.
+      compileSqlOnError: false,
       connection: {
         connectionTimeoutMillis: database.connectTimeoutMs,
         application_name: options.applicationName,

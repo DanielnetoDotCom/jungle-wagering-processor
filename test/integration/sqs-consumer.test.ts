@@ -330,6 +330,9 @@ describe('SQS consumer (LocalStack FIFO + inbox + DLQ)', () => {
     const [deadLetter] = await queues.drain(queues.urls.transactionsDlqUrl);
     expect(deadLetter?.MessageAttributes?.deadLetterReason?.StringValue).toBe('PROCESSING_FAILED');
     expect(deadLetter?.MessageAttributes?.errorCode?.StringValue).toBe('LOCK_TIMEOUT');
+    expect(await core.metrics.render()).toMatch(
+      /wagering_sqs_messages_dead_lettered_total\{[^}]*reason="PROCESSING_FAILED"[^}]*\} 1/,
+    );
     const audit = await db.one<{ status: string; result_code: string }>(
       `SELECT status, result_code FROM inbox_messages WHERE message_id = $1`,
       [messageId],

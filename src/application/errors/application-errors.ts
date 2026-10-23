@@ -122,3 +122,20 @@ export class IntegrityViolationError extends ApplicationError {
     super(message, undefined, cause);
   }
 }
+
+/**
+ * Any other database error. Its message names only the SQLSTATE: driver
+ * messages quote SQL bindings and row values (player ids, amounts, keys),
+ * which must never reach the logs. The original error stays in `cause`.
+ */
+export class UnexpectedDatabaseError extends ApplicationError {
+  readonly code = 'DATABASE_ERROR';
+  readonly category = ErrorCategory.Internal;
+
+  constructor(
+    readonly sqlState: string,
+    cause?: unknown,
+  ) {
+    super(`Database error (SQLSTATE ${sqlState})`, undefined, cause);
+  }
+}

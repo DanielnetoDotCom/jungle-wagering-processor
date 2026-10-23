@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MIGRATIONS } from '../../migrations';
+import { expectAllWalletsConsistent } from '../support/consistency';
 import { TestDatabase } from '../support/database';
 import { createTestCore } from '../support/core';
 import { httpCommand, payload, uniqueId } from '../support/fixtures';
@@ -15,6 +16,9 @@ const TABLES = [
 
 /** Back to the schema that predates FinancialIntegrity (later migrations are reverted first). */
 async function downToBeforeFinancialIntegrity(dbName: string): Promise<void> {
+  expect(await TestDatabase.migrate(dbName, 'down')).toEqual([
+    'Migration20261023000200ReservedInternalProvider',
+  ]);
   expect(await TestDatabase.migrate(dbName, 'down')).toEqual(['Migration20261023000100InboxAttempts']);
   expect(await TestDatabase.migrate(dbName, 'down')).toEqual(['Migration20261022000500FinancialIntegrity']);
 }
@@ -27,6 +31,8 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
   });
 
   afterAll(async () => {
+    // Wallets written across downgrades and upgrades must still match their ledger.
+    expect(await expectAllWalletsConsistent(db)).toBeGreaterThan(0);
     await db.drop();
   });
 
@@ -90,8 +96,9 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
 
   test('down reverts one step; down --all removes the whole schema; up rebuilds it', async () => {
     const reverted = await TestDatabase.migrate(db.name, 'down');
-    expect(reverted).toEqual(['Migration20261023000100InboxAttempts']);
+    expect(reverted).toEqual(['Migration20261023000200ReservedInternalProvider']);
     expect(await executed()).toHaveLength(MIGRATIONS.length - 1);
+    expect(await TestDatabase.migrate(db.name, 'down')).toEqual(['Migration20261023000100InboxAttempts']);
     expect(await TestDatabase.migrate(db.name, 'down')).toEqual([
       'Migration20261022000500FinancialIntegrity',
     ]);

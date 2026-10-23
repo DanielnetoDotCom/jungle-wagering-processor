@@ -213,8 +213,24 @@ describe('ROLLBACK', () => {
 
   test('ROLLBACK of a ROLLBACK or of a LOSS is not allowed', () => {
     const loss = processed(Kind.Loss, '0.00', { externalTransactionId: 'loss-1' });
-    const rollback = transaction(Kind.Rollback, '0.01', { reference: 'loss-1' });
-    expect(service.settle(rollback, wallet('5.00'), context({ reference: loss })).type).toBe('REJECTED');
+    const ofLoss = transaction(Kind.Rollback, '0.01', { reference: 'loss-1' });
+    expect(service.settle(ofLoss, wallet('5.00'), context({ reference: loss }))).toEqual({
+      type: 'REJECTED',
+      code: FailureCode.ReferenceKindNotAllowed,
+    });
+
+    const w = wallet('100.00');
+    const rolledBack = processed(Kind.Rollback, '80.00', {
+      externalTransactionId: 'rb-1',
+      reference: 'bet-1',
+    });
+    const ofRollback = transaction(Kind.Rollback, '80.00', { reference: 'rb-1' });
+    expect(service.settle(ofRollback, w, context({ reference: rolledBack }))).toEqual({
+      type: 'REJECTED',
+      code: FailureCode.ReferenceKindNotAllowed,
+    });
+    expect(w.balance.amount).toBe('100.00');
+    expect(w.version).toBe(1);
   });
 });
 

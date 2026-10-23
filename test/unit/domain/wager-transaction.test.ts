@@ -81,6 +81,37 @@ describe('WagerTransaction.create', () => {
     ).toBe(Kind.Opening);
   });
 
+  test('the internal provider id is reserved to the internal channel', () => {
+    const base = {
+      id: 'id',
+      externalTransactionId: 'e',
+      idempotencyKey: 'k',
+      payloadHash: HASH,
+      walletId: 'w',
+      playerId: 'p',
+      roundId: 'r',
+      gameId: 'g',
+      money: brl('1.00'),
+      referenceExternalTransactionId: undefined,
+      createdAt: NOW,
+    };
+    for (const channel of [TransactionChannel.Http, TransactionChannel.Sqs]) {
+      expect(() =>
+        WagerTransaction.create({ ...base, providerId: 'internal', kind: Kind.Bet, channel }),
+      ).toThrow(DomainValidationError);
+    }
+    expect(() =>
+      WagerTransaction.create({
+        ...base,
+        providerId: 'provider-a',
+        kind: Kind.Opening,
+        roundId: undefined,
+        gameId: undefined,
+        channel: TransactionChannel.Internal,
+      }),
+    ).toThrow(DomainValidationError);
+  });
+
   test('payload hash must be a SHA-256 hex digest', () => {
     expect(() =>
       WagerTransaction.create({
@@ -228,7 +259,53 @@ describe('WagerTransaction domain queries', () => {
       playerId: 'other',
     });
     expect(refund.referenceMismatches(reference).sort()).toEqual(['playerId', 'roundId']);
+    const elsewhere = transaction(Kind.Refund, '1.00', {
+      reference: 'bet-1',
+      providerId: 'provider-b',
+      walletId: 'wallet-2',
+      currency: 'USD',
+    });
+    expect(elsewhere.referenceMismatches(reference).sort()).toEqual(['currency', 'providerId', 'walletId']);
     const ok = transaction(Kind.Refund, '1.00', { reference: 'bet-1' });
     expect(ok.referenceMismatches(reference)).toEqual([]);
+  });
+
+  test('rehydrate trusts persisted state: no create validation and no transition re-run', () => {
+    const original = processed(Kind.Bet, '25.00', { externalTransactionId: 'bet-1' });
+    const state = {
+      id: original.id,
+      providerId: original.providerId,
+      externalTransactionId: original.externalTransactionId,
+      idempotencyKey: original.idempotencyKey,
+      payloadHash: HASH,
+      channel: TransactionChannel.Http,
+      walletId: original.walletId,
+      playerId: original.playerId,
+      roundId: original.roundId,
+      gameId: original.gameId,
+      kind: original.kind,
+      money: original.money,
+      referenceExternalTransactionId: undefined,
+      createdAt: NOW,
+      status: Status.Processed,
+      referenceTransactionId: undefined,
+      failureCode: undefined,
+      processedAt: NOW,
+      result: original.result,
+      referenceAttempts: 0,
+      nextAttemptAt: undefined,
+      referenceExpiresAt: undefined,
+      updatedAt: NOW,
+    };
+    const restored = WagerTransaction.rehydrate(state);
+    expect(restored.status).toBe(Status.Processed);
+    expect(restored.isTerminal()).toBe(true);
+    expect(restored.result?.balance.amount).toBe(original.result?.balance.amount);
+    // A legacy row that today's create() would refuse (blank round) still loads.
+    expect(WagerTransaction.rehydrate({ ...state, roundId: undefined }).roundId).toBeUndefined();
+    // Terminal state loaded from the database still refuses every transition.
+    expect(() =>
+      restored.reject(FailureCode.InsufficientFunds, { at: NOW, result: original.result! }),
+    ).toThrow(InvalidTransactionStateError);
   });
 });

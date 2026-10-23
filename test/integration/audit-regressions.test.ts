@@ -3,7 +3,13 @@ import { randomUUID } from 'node:crypto';
 import type { Client } from 'pg';
 import type { Core } from '../../src/bootstrap/core';
 import { Money } from '../../src/domain/money/money';
-import { TransientInfrastructureError } from '../../src/application/errors/application-errors';
+import type { SqlEntityManager } from '@mikro-orm/postgresql';
+import {
+  IntegrityViolationError,
+  TransientInfrastructureError,
+} from '../../src/application/errors/application-errors';
+import { describeError } from '../../src/infrastructure/logging/logger';
+import { WalletRecord } from '../../src/infrastructure/persistence/mikroorm/records';
 import { CreateWalletUseCase } from '../../src/application/use-cases/create-wallet.use-case';
 import type { UnitOfWork } from '../../src/application/ports/persistence.ports';
 import { createTestCore } from '../support/core';
@@ -187,6 +193,55 @@ describe('Audit regressions against PostgreSQL', () => {
     } finally {
       await client.end();
     }
+  });
+
+  test('database errors never carry SQL bindings or row values into what gets logged', async () => {
+    const secret = uniqueId('secret-player');
+    const logged = async (work: (em: SqlEntityManager) => Promise<unknown>) => {
+      const error: unknown = await core.uow
+        .run(() => work(core.orm.em.fork()))
+        .then(() => undefined)
+        .catch((caught: unknown) => caught);
+      expect(error).toBeInstanceOf(Error);
+      return { error, text: JSON.stringify(describeError(error)) };
+    };
+
+    // Hand-written SQL: knex used to inline the bindings into the message.
+    const bound = await logged((em) =>
+      em
+        .getKnex()
+        .raw(`INSERT INTO wallets VALUES (?, ?, 'BRL', -1, 1, now(), now())`, [randomUUID(), secret]),
+    );
+    expect(bound.error).toBeInstanceOf(IntegrityViolationError);
+    expect(bound.text).toContain('wallets_balance_non_negative_ck');
+    expect(bound.text).not.toContain(secret);
+
+    // ORM flush: the PostgreSQL detail ("Failing row contains (...)") used to be appended.
+    const flushed = await logged(async (em) => {
+      const now = new Date();
+      em.persist(
+        em.create(WalletRecord, {
+          id: randomUUID(),
+          playerId: secret,
+          currency: 'BRL',
+          balanceAmount: '-1.00',
+          version: 1,
+          createdAt: now,
+          updatedAt: now,
+        }),
+      );
+      await em.flush();
+    });
+    expect(flushed.error).toBeInstanceOf(IntegrityViolationError);
+    expect(flushed.text).not.toContain(secret);
+    expect(flushed.text).not.toContain('-1.00');
+
+    // Errors without a dedicated mapping (here 22P02) quote the offending value.
+    const unmapped = await logged((em) =>
+      em.getKnex().raw('SELECT 1 FROM wallets WHERE id = ?::uuid', [secret]),
+    );
+    expect(unmapped.text).toContain('22P02');
+    expect(unmapped.text).not.toContain(secret);
   });
 
   async function recorded(): Promise<number> {

@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { randomUUID } from 'node:crypto';
 import { DeleteMessageCommand, ReceiveMessageCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
+import { expectAllWalletsConsistent } from '../support/consistency';
 import { TestDatabase } from '../support/database';
 import { ServiceProcess, stopAll, type ServiceKind } from '../support/processes';
 import { TestQueues } from '../support/sqs';
@@ -57,6 +58,8 @@ describe('E2E: isolated compiled services', () => {
         const report = await call<{ consistent: boolean }>('POST', `/wallets/${walletId}/reconciliation`);
         expect(report.body.consistent).toBe(true);
       }
+      // Independent SQL audit, not only the application's own reconciliation endpoint.
+      expect(await expectAllWalletsConsistent(database)).toBeGreaterThanOrEqual(touchedWallets.length);
     } finally {
       await stopAll(services);
       await queues?.destroy();

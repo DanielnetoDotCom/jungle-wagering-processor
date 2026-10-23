@@ -54,6 +54,7 @@ describe('HTTP wager contract', () => {
     ],
     ['zero BET', { ...valid, money: { amount: '0.00', currency: 'BRL' } }],
     ['blank providerId', { ...valid, providerId: '' }],
+    ['reserved internal providerId', { ...valid, providerId: 'internal' }],
     ['identifier with spaces', { ...valid, roundId: 'round 1' }],
   ])('rejects: %s', (_label, body) => {
     expect(wagerTransactionRequestSchema.safeParse(body).success).toBe(false);
@@ -98,6 +99,12 @@ describe('SQS message contract', () => {
       wagerTransactionRequestedMessageSchema.safeParse({
         ...message,
         data: { ...message.data, kind: 'OPENING' },
+      }).success,
+    ).toBe(false);
+    expect(
+      wagerTransactionRequestedMessageSchema.safeParse({
+        ...message,
+        data: { ...message.data, providerId: 'internal' },
       }).success,
     ).toBe(false);
   });

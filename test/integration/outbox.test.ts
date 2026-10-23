@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import type { EventPublisher, PublishResult } from '../../src/application/ports/event-publisher.port';
+import { BacklogQueries } from '../../src/application/queries/backlog-queries';
 import type { Core } from '../../src/bootstrap/core';
 import type { OutboxMessage } from '../../src/domain/messaging/outbox-message';
 import { WagerTransactionKind as Kind } from '../../src/domain/wagering/wager-transaction-types';
@@ -272,6 +273,51 @@ describe('Transactional outbox -> SQS (LocalStack)', () => {
       if (firstTime) applied += 1;
     }
     expect(applied).toBe(ids.length);
+  });
+
+  test('a publication that keeps dying before its confirmation is retained as DEAD after max attempts, not republished forever', async () => {
+    await produceEvents(1);
+    const ids = await pendingIds();
+    faults.on('outbox.after-publish-before-confirm', () =>
+      Promise.reject(new Error('publisher died before confirming')),
+    );
+    // OUTBOX_MAX_ATTEMPTS=3: every claim is an attempt, even when nobody gets to record its outcome.
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      await expect(publisherA.publishOutbox.execute('worker-a')).rejects.toThrow('publisher died');
+      clock.advance(30_001);
+    }
+    faults.clear();
+
+    const retired = await publisherB.publishOutbox.execute('worker-b');
+    expect(retired).toMatchObject({ claimed: 0, published: 0, dead: 4 });
+    const rows = await db.query<{ status: string; attempts: number; claimed_by: string | null }>(
+      `SELECT status, attempts, claimed_by FROM outbox_messages WHERE id = ANY($1)`,
+      [ids],
+    );
+    expect(rows).toHaveLength(4);
+    expect(rows.every((row) => row.status === 'DEAD' && row.attempts === 3 && row.claimed_by === null)).toBe(
+      true,
+    );
+    expect(await publisherB.metrics.render()).toMatch(/wagering_outbox_dead_total\{[^}]*\} 4/);
+    // Retained for an operator, never republished again on its own.
+    clock.advance(30_001);
+    expect((await publisherB.publishOutbox.execute('worker-b')).claimed).toBe(0);
+  });
+
+  test('outbox lag gauge: age of the oldest unpublished event, back to zero once published', async () => {
+    await produceEvents(1);
+    const backlog = new BacklogQueries(publisherA.uow, clock);
+    const lag = async () => {
+      publisherA.metrics.setOutboxBacklog(await backlog.outbox());
+      const line = (await publisherA.metrics.render())
+        .split('\n')
+        .find((row) => row.startsWith('wagering_outbox_lag_seconds{'));
+      return Number(line?.slice(line.lastIndexOf(' ') + 1));
+    };
+    // The publisher's clock runs 10 minutes ahead of the writer: the events are ~600s old for it.
+    expect(await lag()).toBeGreaterThan(500);
+    await publishEverything();
+    expect(await lag()).toBe(0);
   });
 
   test('events are never visible before the financial commit', async () => {

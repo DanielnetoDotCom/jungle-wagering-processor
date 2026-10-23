@@ -89,6 +89,7 @@ describe('Schema guarantees enforced by PostgreSQL', () => {
       referenceId?: string;
       failure?: string;
       channel?: string;
+      provider?: string;
     },
   ): Promise<unknown> {
     const external = row.external ?? uniqueId('raw');
@@ -96,7 +97,7 @@ describe('Schema guarantees enforced by PostgreSQL', () => {
         (id, provider_id, external_transaction_id, idempotency_key, payload_hash, channel, wallet_id, player_id, round_id, game_id,
          kind, amount, currency, reference_external_transaction_id, reference_transaction_id, status, failure_code,
          result_balance_amount, result_wallet_version, created_at, updated_at, processed_at)
-      VALUES (gen_random_uuid(), 'provider-a', $1::varchar, $1::varchar, repeat('a', 64), $2::varchar, $3::uuid, $4::varchar,
+      VALUES (gen_random_uuid(), $11::varchar, $1::varchar, $1::varchar, repeat('a', 64), $2::varchar, $3::uuid, $4::varchar,
               'round-1', 'fortune-chimp', $5::varchar, $6::numeric, 'BRL', $7::varchar, $8::uuid, $9::varchar, $10::varchar,
               70.00, 2, now(), now(), CASE WHEN $9::varchar IN ('PROCESSED','REJECTED','FAILED') THEN now() END)
       RETURNING id`;
@@ -111,6 +112,7 @@ describe('Schema guarantees enforced by PostgreSQL', () => {
       row.referenceId ?? null,
       row.status,
       row.failure ?? null,
+      row.provider ?? 'provider-a',
     ];
     return client instanceof TestDatabase ? client.query(query, params) : client.query(query, params);
   }
@@ -229,16 +231,33 @@ describe('Schema guarantees enforced by PostgreSQL', () => {
             status: 'PROCESSED',
           });
           const id = (inserted as { rows: Array<{ id: string }> }).rows[0]?.id;
-          await client.query(`UPDATE wallets SET balance_amount = 65.00, version = 3 WHERE id = $1`, [
+          // The wallet moves to what the line claims, so only the broken chain is wrong:
+          // balance_before 71.00 does not continue the previous balance_after 70.00.
+          await client.query(`UPDATE wallets SET balance_amount = 66.00, version = 3 WHERE id = $1`, [
             walletId,
           ]);
-          // balance_before 71.00 does not continue the previous balance_after 70.00
           await client.query(
             `INSERT INTO wallet_ledger_entries VALUES (gen_random_uuid(), $1, $2, 'DEBIT', 5.00, 'BRL', 71.00, 66.00, 3, now())`,
             [walletId, id],
           );
         }),
-        { code: '23514' },
+        { code: '23514', constraint: 'ledger_chain_continuity' },
+      );
+      await rejects(
+        inTransaction(async (client) => {
+          const inserted = await insertTransaction(client, {
+            kind: 'BET',
+            amount: '5.00',
+            status: 'PROCESSED',
+          });
+          const id = (inserted as { rows: Array<{ id: string }> }).rows[0]?.id;
+          // A chained line with no matching balance change on the wallet.
+          await client.query(
+            `INSERT INTO wallet_ledger_entries VALUES (gen_random_uuid(), $1, $2, 'DEBIT', 5.00, 'BRL', 70.00, 65.00, 3, now())`,
+            [walletId, id],
+          );
+        }),
+        { code: '23514', constraint: 'ledger_entry_has_balance_change' },
       );
     });
 
@@ -338,9 +357,7 @@ describe('Schema guarantees enforced by PostgreSQL', () => {
       });
       await rejects(
         db.query(`UPDATE wager_transactions SET reference_attempts = -1 WHERE id = $1`, [pendingId]),
-        {
-          code: '23514',
-        },
+        { code: '23514', constraint: 'wager_tx_attempts_monotonic' },
       );
     });
 
@@ -442,6 +459,29 @@ describe('Schema guarantees enforced by PostgreSQL', () => {
         {
           constraint: 'wager_tx_opening_internal_ck',
         },
+      );
+    });
+
+    test('the internal provider id is reserved to the internal channel', async () => {
+      await rejects(
+        insertTransaction(db, {
+          kind: 'BET',
+          amount: '5.00',
+          status: 'REJECTED',
+          failure: 'X',
+          provider: 'internal',
+        }),
+        { constraint: 'wager_tx_internal_provider_ck' },
+      );
+      await rejects(
+        insertTransaction(db, {
+          kind: 'OPENING',
+          amount: '5.00',
+          status: 'REJECTED',
+          failure: 'X',
+          channel: 'INTERNAL',
+        }),
+        { constraint: 'wager_tx_internal_provider_ck' },
       );
     });
   });

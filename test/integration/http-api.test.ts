@@ -167,6 +167,7 @@ describe('REST API (Nest + Express, real PostgreSQL and SQS)', () => {
       });
       await submit(wager(walletId, playerId)); // Move the wallet after recording the rejection.
       const replay = await submit(body);
+      expect(replay.status).toBe(422); // a replayed rejection keeps its status code
       expect(replay.body).toEqual({
         ...first.body,
         correlationId: replay.body.correlationId,
@@ -200,6 +201,11 @@ describe('REST API (Nest + Express, real PostgreSQL and SQS)', () => {
       expect(replay.status).toBe(200);
       expect(replay.headers.get('idempotent-replayed')).toBe('true');
       expect(replay.body).toEqual({ ...first.body, idempotentReplay: true });
+      const metrics = await core.metrics.render();
+      expect(metrics).toMatch(
+        /wagering_processing_duration_seconds_count\{[^}]*outcome="RECORDED"[^}]*\} [1-9]/,
+      );
+      expect(metrics).toMatch(/wagering_idempotent_replays_total\{[^}]*channel="HTTP"[^}]*\} [1-9]/);
     });
 
     test('Idempotency-Key is mandatory', async () => {
@@ -240,11 +246,21 @@ describe('REST API (Nest + Express, real PostgreSQL and SQS)', () => {
 
     test('reference not available yet -> 202 Accepted, pollable via Location', async () => {
       const { walletId, playerId } = await createWallet();
-      const response = await submit(
-        wager(walletId, playerId, { kind: 'REFUND', referenceExternalTransactionId: uniqueId('later') }),
-      );
+      const refund = wager(walletId, playerId, {
+        kind: 'REFUND',
+        referenceExternalTransactionId: uniqueId('later'),
+      });
+      const response = await submit(refund);
       expect(response.status).toBe(202);
       expect(response.body).toMatchObject({ status: 'PENDING_REFERENCE', idempotentReplay: false });
+      // Retrying while it still waits: 202 again, as a replay of the same transaction.
+      const retried = await submit(refund);
+      expect(retried.status).toBe(202);
+      expect(retried.body).toMatchObject({
+        transactionId: response.body.transactionId,
+        status: 'PENDING_REFERENCE',
+        idempotentReplay: true,
+      });
       const location = response.headers.get('location') ?? '';
       expect((await call('GET', location)).body).toMatchObject({
         status: 'PENDING_REFERENCE',
@@ -357,6 +373,57 @@ describe('REST API (Nest + Express, real PostgreSQL and SQS)', () => {
         consistent: true,
         checkedEntries: 2,
       });
+    });
+  });
+
+  describe('provider scoping (authentication extension point)', () => {
+    test('a caller scoped to another provider gets 403 on its routes and 404 on a foreign transaction id', async () => {
+      const { walletId, playerId } = await createWallet();
+      const bet = wager(walletId, playerId);
+      const created = await submit(bet);
+      expect(created.status).toBe(201);
+      const transactionId = String(created.body.transactionId);
+
+      const scopedCore = await createTestCore(db, { queues: queues.names });
+      const scoped = await createNestApp(
+        scopedCore,
+        ApiModule.register(scopedCore, {
+          resolve: () => Promise.resolve({ subject: 'other', providers: ['provider-b'], mechanism: 'oidc' }),
+        }),
+      );
+      try {
+        await scoped.listen(0, '127.0.0.1');
+        const { port } = scoped.getHttpServer().address() as { port: number };
+        const scopedCall = async (method: string, path: string, body?: unknown) => {
+          const response = await fetch(`http://127.0.0.1:${port}${path}`, {
+            method,
+            headers: {
+              'content-type': 'application/json',
+              'Idempotency-Key': `provider-a:${String(bet.externalTransactionId)}`,
+            },
+            body: body === undefined ? undefined : JSON.stringify(body),
+          });
+          return { status: response.status, body: (await response.json()) as Record<string, unknown> };
+        };
+
+        expect(await scopedCall('POST', '/wagering/transactions', bet)).toMatchObject({
+          status: 403,
+          body: { code: 'PROVIDER_FORBIDDEN' },
+        });
+        expect(
+          await scopedCall(
+            'GET',
+            `/providers/provider-a/wagering/transactions/${String(bet.externalTransactionId)}`,
+          ),
+        ).toMatchObject({ status: 403, body: { code: 'PROVIDER_FORBIDDEN' } });
+        // By internal id: indistinguishable from a missing transaction (no existence oracle).
+        expect(await scopedCall('GET', `/wagering/transactions/${transactionId}`)).toMatchObject({
+          status: 404,
+          body: { code: 'TRANSACTION_NOT_FOUND' },
+        });
+      } finally {
+        await scoped.close();
+      }
     });
   });
 

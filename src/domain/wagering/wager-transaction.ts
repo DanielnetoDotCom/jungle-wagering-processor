@@ -7,6 +7,7 @@ import { LedgerDirection, oppositeDirection } from '../ledger/ledger-direction';
 import { Money } from '../money/money';
 import {
   FailureCode,
+  INTERNAL_PROVIDER_ID,
   TERMINAL_STATUSES,
   TransactionChannel,
   WagerTransactionKind,
@@ -416,6 +417,12 @@ export class WagerTransaction {
       throw new DomainValidationError(
         'OPENING is internal only and the internal channel only creates OPENING',
         'kind',
+      );
+    }
+    if ((props.providerId === INTERNAL_PROVIDER_ID) !== (props.channel === TransactionChannel.Internal)) {
+      throw new DomainValidationError(
+        `providerId "${INTERNAL_PROVIDER_ID}" is reserved to internal transactions`,
+        'providerId',
       );
     }
     if (!isOpening && (!props.roundId?.trim() || !props.gameId?.trim())) {

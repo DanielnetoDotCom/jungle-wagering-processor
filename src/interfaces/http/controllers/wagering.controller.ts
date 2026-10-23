@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Headers, Inject, Param, Post, Req, Res, UseGuards } from '@nestjs/common';
 import type { Request, Response } from 'express';
+import { ResourceNotFoundError } from '../../../application/errors/application-errors';
 import { WalletQueries } from '../../../application/queries/wallet-queries';
 import { ProcessWagerTransactionUseCase } from '../../../application/use-cases/process-wager-transaction.use-case';
 import type { WagerTransactionView } from '../../../application/views';
@@ -13,7 +14,7 @@ import {
   type WagerTransactionRequest,
   wagerTransactionRequestSchema,
 } from '../../contracts/wager-contracts';
-import { assertCanActFor, ProviderAuthGuard } from '../auth/provider-identity';
+import { assertCanActFor, canActFor, ProviderAuthGuard } from '../auth/provider-identity';
 import { presentSubmission } from '../presenters/wager-presenter';
 import { currentCorrelationId, currentRequestId } from '../support/request-context';
 import { ZodValidationPipe } from '../support/zod-validation.pipe';
@@ -60,11 +61,17 @@ export class WageringController {
     return presented.body;
   }
 
+  /** A transaction of a provider the caller cannot act for is reported as missing (no existence oracle). */
   @Get('wagering/transactions/:transactionId')
-  getTransaction(
+  async getTransaction(
     @Param('transactionId', new ZodValidationPipe(uuidSchema, 'transactionId')) transactionId: string,
+    @Req() request: Request,
   ): Promise<WagerTransactionView> {
-    return this.queries.getTransaction(transactionId);
+    const transaction = await this.queries.getTransaction(transactionId);
+    if (!canActFor(request, transaction.providerId)) {
+      throw new ResourceNotFoundError('TRANSACTION_NOT_FOUND', `Transaction ${transactionId} not found`);
+    }
+    return transaction;
   }
 
   @Get('providers/:providerId/wagering/transactions/:externalTransactionId')

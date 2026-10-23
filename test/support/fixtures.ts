@@ -126,13 +126,13 @@ export class Latch {
 }
 
 export async function waitFor<T>(
-  probe: () => Promise<T | undefined | false>,
+  probe: () => Promise<T | undefined | null | false>,
   options: { timeoutMs?: number; intervalMs?: number; description?: string } = {},
 ): Promise<T> {
   const deadline = Date.now() + (options.timeoutMs ?? 30_000);
   for (;;) {
     const value = await probe();
-    if (value !== undefined && value !== false) return value;
+    if (value !== undefined && value !== null && value !== false) return value;
     if (Date.now() > deadline) throw new Error(`Timed out waiting for ${options.description ?? 'condition'}`);
     await new Promise((resolve) => setTimeout(resolve, options.intervalMs ?? 100));
   }

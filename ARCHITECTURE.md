@@ -1,34 +1,34 @@
-# Arquitetura — Distributed Wagering Processor
+# Architecture — Distributed Wagering Processor
 
-Este documento justifica as decisões técnicas da solução: o que foi escolhido, o que foi descartado, por quê, e quais as consequências e limitações. Cada afirmação aponta para o código ou para o teste que a comprova.
+This document justifies the technical decisions behind the solution: what was chosen, what was ruled out, why, and what the consequences and limitations are. Every claim points to the code or the test that proves it.
 
-## Sumário
+## Contents
 
-1. [Visão geral](#1-visão-geral)
-2. [Modelo de domínio e regras](#2-modelo-de-domínio-e-regras)
-3. [Schema: garantias aplicadas pelo PostgreSQL](#3-schema-garantias-aplicadas-pelo-postgresql)
-4. [O caminho financeiro: uma transação SQL](#4-o-caminho-financeiro-uma-transação-sql)
-5. [ADRs](#5-adrs) (ADR-001 a ADR-015)
-6. [Diagramas de sequência](#6-diagramas-de-sequência)
-7. [Matriz de falhas](#7-matriz-de-falhas)
-8. [Interpretações e hipóteses adotadas](#8-interpretações-e-hipóteses-adotadas)
-9. [Limitações conhecidas](#9-limitações-conhecidas)
-10. [Escolha de versões](#10-escolha-de-versões)
+1. [Overview](#1-overview)
+2. [Domain model and rules](#2-domain-model-and-rules)
+3. [Schema: guarantees enforced by PostgreSQL](#3-schema-guarantees-enforced-by-postgresql)
+4. [The financial path: one SQL transaction](#4-the-financial-path-one-sql-transaction)
+5. [ADRs](#5-adrs) (ADR-001 to ADR-015)
+6. [Sequence diagrams](#6-sequence-diagrams)
+7. [Failure matrix](#7-failure-matrix)
+8. [Interpretations and assumptions](#8-interpretations-and-assumptions)
+9. [Known limitations](#9-known-limitations)
+10. [Version choices](#10-version-choices)
 
 ---
 
-## 1. Visão geral
+## 1. Overview
 
-Um **monólito modular** implantado como **vários processos independentes**, todos sobre o **mesmo PostgreSQL**. Uma única imagem Docker com seis entrypoints:
+A **modular monolith** deployed as **several independent processes**, all on top of the **same PostgreSQL**. A single Docker image with six entrypoints:
 
 ```mermaid
 flowchart LR
     client([Provider]) -->|HTTP :8080| nginx
     producer([Provider]) -->|SendMessage| q[(wager-transactions.fifo)]
-    subgraph edge[rede edge]
+    subgraph edge[edge network]
         nginx
     end
-    subgraph backend[rede backend - internal]
+    subgraph backend[backend network - internal]
         api1[api #1]
         api2[api #2]
         api3[api #3]
@@ -45,28 +45,28 @@ flowchart LR
     end
     nginx --> api1 & api2 & api3
     q --> c1 & c2 & c3
-    q -. redrive de segurança .-> dlq
-    c1 & c2 & c3 -. erro permanente .-> dlq
-    api1 & api2 & api3 & c1 & c2 & c3 & r1 -->|uma transação por operação| pg
+    q -. safety-net redrive .-> dlq
+    c1 & c2 & c3 -. permanent error .-> dlq
+    api1 & api2 & api3 & c1 & c2 & c3 & r1 -->|one transaction per operation| pg
     o1 & o2 -->|claim / confirm| pg
     o1 & o2 -->|SendMessageBatch| ev
 ```
 
-| Processo | Entrypoint | Réplicas | Responsabilidade |
+| Process | Entrypoint | Replicas | Responsibility |
 |---|---|---|---|
-| `api` | `src/entrypoints/api.ts` | 3 | REST, health, métricas. Não roda workers. |
-| `consumer` | `src/entrypoints/consumer.ts` | 3 | Consome `wager-transactions.fifo` com o **mesmo use case** da API. |
-| `outbox-worker` | `src/entrypoints/outbox-worker.ts` | 2 | Publica eventos confirmados em `wager-events.fifo`. |
-| `reference-worker` | `src/entrypoints/reference-worker.ts` | 1 (seguro com N) | Reprocessa `PENDING_REFERENCE`. |
-| `migrations` | `src/entrypoints/migrate.ts` | job | Migrations versionadas + provisionamento do login de runtime. |
-| `queue-bootstrap` | `src/entrypoints/bootstrap-queues.ts` | job | Criação idempotente das filas FIFO e da DLQ. |
+| `api` | `src/entrypoints/api.ts` | 3 | REST, health, metrics. Does not run workers. |
+| `consumer` | `src/entrypoints/consumer.ts` | 3 | Consumes `wager-transactions.fifo` with the **same use case** as the API. |
+| `outbox-worker` | `src/entrypoints/outbox-worker.ts` | 2 | Publishes committed events to `wager-events.fifo`. |
+| `reference-worker` | `src/entrypoints/reference-worker.ts` | 1 (safe with N) | Reprocesses `PENDING_REFERENCE`. |
+| `migrations` | `src/entrypoints/migrate.ts` | job | Versioned migrations + provisioning of the runtime login. |
+| `queue-bootstrap` | `src/entrypoints/bootstrap-queues.ts` | job | Idempotent creation of the FIFO queues and the DLQ. |
 
-### Camadas (hexagonal)
+### Layers (hexagonal)
 
 ```mermaid
 flowchart TB
-    subgraph interfaces[src/interfaces - adaptadores de entrada]
-        http[HTTP: controllers, contratos zod, filtro de erros, presenters]
+    subgraph interfaces[src/interfaces - inbound adapters]
+        http[HTTP: controllers, zod contracts, error filter, presenters]
         cons[SQS consumer]
     end
     subgraph workers[src/workers]
@@ -75,45 +75,45 @@ flowchart TB
     end
     subgraph application[src/application]
         uc[use cases, queries, SettlementRecorder, retry]
-        ports[[ports: UnitOfWork, repositórios, Clock, IdGenerator, EventPublisher, Metrics, FaultInjector]]
+        ports[[ports: UnitOfWork, repositories, Clock, IdGenerator, EventPublisher, Metrics, FaultInjector]]
     end
-    subgraph domain[src/domain - sem frameworks]
+    subgraph domain[src/domain - no frameworks]
         d[Money, Wallet, WagerTransaction, WalletLedgerEntry, Inbox/OutboxMessage, IntegrationEvent, WagerSettlementService]
     end
-    subgraph infrastructure[src/infrastructure - adaptadores de saída]
-        orm[MikroORM + SQL parametrizado]
+    subgraph infrastructure[src/infrastructure - outbound adapters]
+        orm[MikroORM + parameterized SQL]
         sqs[AWS SDK v3 SQS]
         obs[pino, @prometheus-io/client, health]
     end
-    boot[src/bootstrap - composition root + módulos Nest]
+    boot[src/bootstrap - composition root + Nest modules]
     http & cons & workers --> uc
     uc --> d
     uc --> ports
-    infrastructure -. implementa .-> ports
+    infrastructure -. implements .-> ports
     boot --> interfaces & workers & infrastructure & application
 ```
 
-As fronteiras são **verificadas pelo lint** (`eslint.config.mjs`, regra `no-restricted-imports`): o domínio não pode importar NestJS, MikroORM, AWS SDK, pino, @prometheus-io/client nem camadas externas; a aplicação não pode importar adaptadores.
+The boundaries are **enforced by lint** (`eslint.config.mjs`, rule `no-restricted-imports`): the domain cannot import NestJS, MikroORM, AWS SDK, pino, @prometheus-io/client or outer layers; the application cannot import adapters.
 
 ---
 
-## 2. Modelo de domínio e regras
+## 2. Domain model and rules
 
-### Agregados e value objects (`src/domain`)
+### Aggregates and value objects (`src/domain`)
 
-| Classe | Papel | Garantias encapsuladas |
+| Class | Role | Encapsulated guarantees |
 |---|---|---|
-| `Money` | value object imutável (`Object.freeze`) | `decimal.js`, escala fixa 2, ISO-4217 com 2 casas, rejeita `NaN`/`Infinity`/notação científica/sinal/zeros à esquerda/>2 casas sem arredondar, overflow além de `NUMERIC(20,2)`, operações e comparações só com a mesma moeda. `from` (contrato de entrada, não negativo) × `fromSigned` (diferenças internas). |
-| `Wallet` | aggregate root | saldo só muda por `debit`/`credit`; cada mudança devolve **exatamente um** `WalletLedgerEntry` com a nova versão; versão começa em 1 e só incrementa quando o saldo muda; saldo nunca negativo; moeda única. |
-| `WalletLedgerEntry` | entidade imutável | sem setters nem transições; `create` prova `balanceAfter = balanceBefore ± amount`; valor positivo; mesma moeda. |
-| `WagerTransaction` | entidade com máquina de estados explícita | identidade e conteúdo financeiro `readonly`; transições permitidas em tabela; estados terminais sem saída; `OPENING` só pelo canal interno; referência obrigatória para REFUND/ROLLBACK e proibida para BET. |
-| `InboxMessage` / `OutboxMessage` | registros de mensageria | inbox `PROCESSED` é final; outbox com tentativas, backoff e retenção `DEAD`. |
-| `IntegrationEvent<T>` | envelope abstrato | `eventType` e `version` definidos na subclasse; `data` com dinheiro em string decimal. Subclasses: `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionFailed`, `WagerTransactionPendingReference`, `WalletBalanceChanged`. |
-| `WagerSettlementService` | serviço de domínio | **todas** as regras financeiras, num único método `settle()` usado por HTTP, SQS e worker. |
+| `Money` | immutable value object (`Object.freeze`) | `decimal.js`, fixed scale 2, ISO-4217 with 2 decimal places, rejects `NaN`/`Infinity`/scientific notation/sign/leading zeros/>2 decimal places without rounding, overflow beyond `NUMERIC(20,2)`, operations and comparisons only within the same currency. `from` (input contract, non-negative) vs. `fromSigned` (internal differences). |
+| `Wallet` | aggregate root | balance only changes through `debit`/`credit`; each change returns **exactly one** `WalletLedgerEntry` with the new version; version starts at 1 and only increments when the balance changes; balance never negative; single currency. |
+| `WalletLedgerEntry` | immutable entity | no setters or transitions; `create` proves `balanceAfter = balanceBefore ± amount`; positive amount; same currency. |
+| `WagerTransaction` | entity with an explicit state machine | identity and financial content are `readonly`; allowed transitions defined in a table; terminal states have no way out; `OPENING` only through the internal channel; reference required for REFUND/ROLLBACK and forbidden for BET. |
+| `InboxMessage` / `OutboxMessage` | messaging records | inbox `PROCESSED` is final; outbox with attempts, backoff and `DEAD` retention. |
+| `IntegrationEvent<T>` | abstract envelope | `eventType` and `version` defined in the subclass; `data` with money as a decimal string. Subclasses: `WagerTransactionProcessed`, `WagerTransactionRejected`, `WagerTransactionFailed`, `WagerTransactionPendingReference`, `WalletBalanceChanged`. |
+| `WagerSettlementService` | domain service | **all** financial rules, in a single `settle()` method used by HTTP, SQS and the worker. |
 
-Todas as classes usam construtor privado + factories estáticas (`create`/`open`/`enqueue`/`receive`) e `rehydrate`, que reconstrói o estado persistido **sem** reaplicar regras de transição.
+All classes use a private constructor + static factories (`create`/`open`/`enqueue`/`receive`) and `rehydrate`, which rebuilds persisted state **without** reapplying transition rules.
 
-### Máquina de estados de `WagerTransaction`
+### `WagerTransaction` state machine
 
 ```mermaid
 stateDiagram-v2
@@ -124,391 +124,406 @@ stateDiagram-v2
     PENDING --> PENDING_REFERENCE: markPendingReference()
     PENDING_REFERENCE --> PENDING_REFERENCE: registerReferenceAttempt() + scheduleReferenceRetry()
     PENDING_REFERENCE --> PROCESSED
-    PENDING_REFERENCE --> REJECTED: inclusive REFERENCE_NOT_FOUND
+    PENDING_REFERENCE --> REJECTED: including REFERENCE_NOT_FOUND
     PENDING_REFERENCE --> FAILED: REFERENCE_RESOLUTION_FAILED
     PROCESSED --> [*]
     REJECTED --> [*]
     FAILED --> [*]
 ```
 
-`PENDING` só existe em memória durante a transação SQL: a decisão é tomada antes do commit, e por isso nunca há linha `PENDING` persistida. Transições a partir de estados terminais lançam `InvalidTransactionStateError` (erro de programação). O mesmo é imposto pelo trigger `wager_transactions_guard` no banco.
+`PENDING` only exists in memory during the SQL transaction: the decision is made before the commit, so a `PENDING` row is never persisted. Transitions out of terminal states throw `InvalidTransactionStateError` (a programming error). The same is enforced by the `wager_transactions_guard` trigger in the database.
 
-### Regras financeiras (`WagerSettlementService.settle`)
+### Financial rules (`WagerSettlementService.settle`)
 
-Ordem de avaliação, sob o lock da wallet:
+Evaluation order, under the wallet lock:
 
-1. jogador ≠ dono da wallet → `REJECTED PLAYER_WALLET_MISMATCH`;
-2. moeda ≠ moeda da wallet → `REJECTED CURRENCY_MISMATCH`;
-3. se há referência:
-   - ausente ou ainda não terminal → `PENDING_REFERENCE`;
-   - referência `REJECTED`/`FAILED` → `REJECTED REFERENCE_NOT_PROCESSED`;
-   - outro provider/jogador/wallet/moeda/rodada → `REJECTED REFERENCE_MISMATCH`;
-   - tipo não permitido (REFUND→só BET; ROLLBACK→BET/WIN/REFUND; WIN/LOSS→BET) → `REJECTED REFERENCE_KIND_NOT_ALLOWED`;
-   - reversão com valor diferente → `REJECTED REVERSAL_AMOUNT_MISMATCH`;
-   - referência já revertida com sucesso (REFUND **ou** ROLLBACK) → `REJECTED REFERENCE_ALREADY_REVERSED`;
-4. LOSS → `PROCESSED` sem ledger, sem mudar versão;
-5. direção: BET débito; WIN/REFUND crédito; ROLLBACK inverte a referência (de BET credita; de WIN/REFUND debita);
-6. débito sem saldo → `REJECTED INSUFFICIENT_FUNDS` (BET) ou `REVERSAL_INSUFFICIENT_FUNDS` (ROLLBACK);
-7. crédito que excederia `NUMERIC(20,2)` → `REJECTED BALANCE_LIMIT_EXCEEDED`;
-8. caso contrário `PROCESSED` com exatamente um lançamento.
+1. player ≠ wallet owner → `REJECTED PLAYER_WALLET_MISMATCH`;
+2. currency ≠ wallet currency → `REJECTED CURRENCY_MISMATCH`;
+3. if there is a reference:
+   - missing or not yet terminal → `PENDING_REFERENCE`;
+   - reference `REJECTED`/`FAILED` → `REJECTED REFERENCE_NOT_PROCESSED`;
+   - different provider/player/wallet/currency/round → `REJECTED REFERENCE_MISMATCH`;
+   - kind not allowed (REFUND→BET only; ROLLBACK→BET/WIN/REFUND; WIN/LOSS→BET) → `REJECTED REFERENCE_KIND_NOT_ALLOWED`;
+   - reversal with a different amount → `REJECTED REVERSAL_AMOUNT_MISMATCH`;
+   - reference already successfully reversed (REFUND **or** ROLLBACK) → `REJECTED REFERENCE_ALREADY_REVERSED`;
+4. LOSS → `PROCESSED` with no ledger entry and no version change;
+5. direction: BET debits; WIN/REFUND credit; ROLLBACK inverts the reference (credits for a BET; debits for a WIN/REFUND);
+6. debit without enough balance → `REJECTED INSUFFICIENT_FUNDS` (BET) or `REVERSAL_INSUFFICIENT_FUNDS` (ROLLBACK);
+7. credit that would exceed `NUMERIC(20,2)` → `REJECTED BALANCE_LIMIT_EXCEEDED`;
+8. otherwise `PROCESSED` with exactly one entry.
 
-Testes: `test/unit/domain/wager-settlement.test.ts` (regras), `test/integration/wager-processing.test.ts` (com banco real).
+Tests: `test/unit/domain/wager-settlement.test.ts` (rules), `test/integration/wager-processing.test.ts` (with a real database).
 
-### Taxonomia de `failureCode` (persistida, estável)
+### `failureCode` taxonomy (persisted, stable)
 
-| Código | Status | Significado | O provider deve |
+| Code | Status | Meaning | The provider should |
 |---|---|---|---|
-| `INSUFFICIENT_FUNDS` | REJECTED | BET maior que o saldo | não reenviar a mesma operação |
-| `REVERSAL_INSUFFICIENT_FUNDS` | REJECTED | ROLLBACK de WIN/REFUND deixaria saldo negativo | escalar operacionalmente (situação diferente de aposta sem saldo) |
-| `CURRENCY_MISMATCH` | REJECTED | moeda ≠ moeda da wallet | corrigir o payload (nova `externalTransactionId`) |
-| `PLAYER_WALLET_MISMATCH` | REJECTED | jogador não é dono da wallet | corrigir o payload |
-| `REFERENCE_NOT_FOUND` | REJECTED | referência não apareceu dentro do limite de tentativas/TTL | investigar a ordem de envio |
-| `REFERENCE_MISMATCH` | REJECTED | referência de outro jogador/wallet/moeda/rodada | corrigir o payload |
-| `REFERENCE_KIND_NOT_ALLOWED` | REJECTED | ex.: REFUND de WIN | corrigir o payload |
-| `REFERENCE_NOT_PROCESSED` | REJECTED | referência terminou REJECTED/FAILED | nada a reverter |
-| `REFERENCE_ALREADY_REVERSED` | REJECTED | a referência já tem um REFUND/ROLLBACK bem-sucedido | não reenviar |
-| `REVERSAL_AMOUNT_MISMATCH` | REJECTED | reversão parcial (fora de escopo) | enviar o valor integral |
-| `BALANCE_LIMIT_EXCEEDED` | REJECTED | crédito excederia a precisão suportada | escalar |
-| `REFERENCE_RESOLUTION_FAILED` | FAILED | erros inesperados repetidos ao resolver a referência | escalar (auditável, terminal) |
+| `INSUFFICIENT_FUNDS` | REJECTED | BET larger than the balance | not resend the same operation |
+| `REVERSAL_INSUFFICIENT_FUNDS` | REJECTED | ROLLBACK of a WIN/REFUND would make the balance negative | escalate operationally (a different situation from a bet without funds) |
+| `CURRENCY_MISMATCH` | REJECTED | currency ≠ wallet currency | fix the payload (new `externalTransactionId`) |
+| `PLAYER_WALLET_MISMATCH` | REJECTED | player does not own the wallet | fix the payload |
+| `REFERENCE_NOT_FOUND` | REJECTED | reference did not show up within the attempt limit/TTL | investigate the send order |
+| `REFERENCE_MISMATCH` | REJECTED | reference belongs to another player/wallet/currency/round | fix the payload |
+| `REFERENCE_KIND_NOT_ALLOWED` | REJECTED | e.g. REFUND of a WIN | fix the payload |
+| `REFERENCE_NOT_PROCESSED` | REJECTED | reference ended REJECTED/FAILED | nothing to reverse |
+| `REFERENCE_ALREADY_REVERSED` | REJECTED | the reference already has a successful REFUND/ROLLBACK | not resend |
+| `REVERSAL_AMOUNT_MISMATCH` | REJECTED | partial reversal (out of scope) | send the full amount |
+| `BALANCE_LIMIT_EXCEEDED` | REJECTED | credit would exceed the supported precision | escalate |
+| `REFERENCE_RESOLUTION_FAILED` | FAILED | repeated unexpected errors while resolving the reference | escalate (auditable, terminal) |
 
-Erros que **não** geram transação persistida usam códigos de erro HTTP (ADR-012).
+Errors that **do not** produce a persisted transaction use HTTP error codes (ADR-012).
 
 ---
 
-## 3. Schema: garantias aplicadas pelo PostgreSQL
+## 3. Schema: guarantees enforced by PostgreSQL
 
-As migrations ficam em [`migrations/`](migrations/) e são versionadas e reversíveis (`up`/`down`), testadas em PostgreSQL real em `test/integration/migrations.test.ts`. O teste `test/integration/schema-guarantees.test.ts` **ataca o schema diretamente via SQL**, como owner e como login de runtime, e espera que o banco recuse cada violação.
+The migrations live in [`migrations/`](migrations/) and are versioned and reversible (`up`/`down`), tested against a real PostgreSQL in `test/integration/migrations.test.ts`. The test `test/integration/schema-guarantees.test.ts` **attacks the schema directly via SQL**, as the owner and as the runtime login, and expects the database to refuse every violation.
 
-### Tabelas
+### Tables
 
-| Tabela | Chave | Papel |
+| Table | Key | Role |
 |---|---|---|
-| `wallets` | `id` | saldo materializado (`NUMERIC(20,2)`), `version` |
-| `wager_transactions` | `id` | operações + idempotência + snapshot do resultado + agendamento de referências |
-| `wallet_ledger_entries` | `id` | ledger append-only, uma linha por versão da wallet |
-| `inbox_messages` | `(consumer_name, message_id)` | deduplicação de mensagens |
-| `inbox_attempts` | `(consumer_name, message_id)` | tentativas reais que falharam (orçamento de retry do consumidor) |
-| `outbox_messages` | `id` (= eventId), `seq` identity | eventos a publicar |
+| `wallets` | `id` | materialized balance (`NUMERIC(20,2)`), `version` |
+| `wager_transactions` | `id` | operations + idempotency + result snapshot + reference scheduling |
+| `wallet_ledger_entries` | `id` | append-only ledger, one row per wallet version |
+| `inbox_messages` | `(consumer_name, message_id)` | message deduplication |
+| `inbox_attempts` | `(consumer_name, message_id)` | real attempts that failed (consumer retry budget) |
+| `outbox_messages` | `id` (= eventId), `seq` identity | events to publish |
 
-### Constraints declarativas (migration `…0100`, `…0200`)
+### Declarative constraints (migration `…0100`, `…0200`)
 
-| Garantia | Constraint |
+| Guarantee | Constraint |
 |---|---|
-| 1 wallet por jogador+moeda | `wallets_player_currency_uq` |
-| Saldo nunca negativo | `wallets_balance_non_negative_ck`, `ledger_balances_non_negative_ck`, `wager_tx_result_balance_non_negative_ck` |
-| Idempotência por provider | `wager_tx_provider_idempotency_key_uq (provider_id, idempotency_key)` |
-| Operação externa única por provider | `wager_tx_provider_external_id_uq (provider_id, external_transaction_id)` |
-| Uma linha de ledger por transação | `ledger_transaction_uq (transaction_id)` |
-| Uma linha por versão da wallet (e índice de paginação keyset) | `ledger_wallet_version_uq (wallet_id, wallet_version)` |
-| Aritmética do lançamento | `ledger_arithmetic_ck`: `CREDIT ⇒ after = before + amount`; `DEBIT ⇒ after = before − amount` |
-| Lançamento = valor, moeda e wallet da transação | FK composta `ledger_transaction_fk (transaction_id, wallet_id, currency, amount) → wager_transactions` |
-| Moeda do lançamento = moeda da wallet | FK composta `ledger_wallet_fk (wallet_id, currency) → wallets` |
-| Referência só na mesma wallet | FK composta `wager_tx_reference_same_wallet_fk (reference_transaction_id, wallet_id)` |
-| No máximo **uma reversão bem-sucedida** por referência | índice único parcial `wager_tx_single_successful_reversal_uq (reference_transaction_id) WHERE status='PROCESSED' AND kind IN ('REFUND','ROLLBACK')` |
-| Mensagem única por consumidor | `inbox_messages_pk (consumer_name, message_id)` |
-| Coerência de status | `failure_code` ⇔ REJECTED/FAILED; `processed_at` ⇔ terminal; snapshot obrigatório fora de PENDING; agenda obrigatória em PENDING_REFERENCE; claim só em estados não terminais |
-| OPENING só interno | `wager_tx_opening_internal_ck ((kind='OPENING') = (channel='INTERNAL'))` |
-| Valores positivos (exceto LOSS) | `wager_tx_amount_positive_ck`, `ledger_amount_positive_ck` |
+| 1 wallet per player+currency | `wallets_player_currency_uq` |
+| Balance never negative | `wallets_balance_non_negative_ck`, `ledger_balances_non_negative_ck`, `wager_tx_result_balance_non_negative_ck` |
+| Idempotency per provider | `wager_tx_provider_idempotency_key_uq (provider_id, idempotency_key)` |
+| Unique external operation per provider | `wager_tx_provider_external_id_uq (provider_id, external_transaction_id)` |
+| One ledger row per transaction | `ledger_transaction_uq (transaction_id)` |
+| One row per wallet version (and keyset pagination index) | `ledger_wallet_version_uq (wallet_id, wallet_version)` |
+| Entry arithmetic | `ledger_arithmetic_ck`: `CREDIT ⇒ after = before + amount`; `DEBIT ⇒ after = before − amount` |
+| Entry = amount, currency and wallet of the transaction | composite FK `ledger_transaction_fk (transaction_id, wallet_id, currency, amount) → wager_transactions` |
+| Entry currency = wallet currency | composite FK `ledger_wallet_fk (wallet_id, currency) → wallets` |
+| Reference only within the same wallet | composite FK `wager_tx_reference_same_wallet_fk (reference_transaction_id, wallet_id)` |
+| At most **one successful reversal** per reference | partial unique index `wager_tx_single_successful_reversal_uq (reference_transaction_id) WHERE status='PROCESSED' AND kind IN ('REFUND','ROLLBACK')` |
+| Unique message per consumer | `inbox_messages_pk (consumer_name, message_id)` |
+| Status consistency | `failure_code` ⇔ REJECTED/FAILED; `processed_at` ⇔ terminal; snapshot required outside PENDING; schedule required in PENDING_REFERENCE; claim only in non-terminal states |
+| OPENING internal only | `wager_tx_opening_internal_ck ((kind='OPENING') = (channel='INTERNAL'))` |
+| Provider id `internal` reserved to the system (migration `…1023000200`) | `wager_tx_internal_provider_ck ((provider_id='internal') = (channel='INTERNAL'))` |
+| Positive amounts (except LOSS) | `wager_tx_amount_positive_ck`, `ledger_amount_positive_ck` |
 
-As FKs são `DEFERRABLE INITIALLY DEFERRED`: continuam sendo verificadas, mas no COMMIT, o que libera a ordem dos INSERTs dentro da transação financeira.
+The FKs are `DEFERRABLE INITIALLY DEFERRED`: they are still checked, but at COMMIT, which frees the order of the INSERTs inside the financial transaction.
 
 ### Triggers (migration `…0300`)
 
-Regras entre linhas que um `CHECK` não expressa:
+Cross-row rules that a `CHECK` cannot express:
 
-| Trigger | Quando | Garante |
+| Trigger | When | Guarantees |
 |---|---|---|
-| `wallet_ledger_entries_append_only` / `_no_truncate` | UPDATE/DELETE/TRUNCATE | ledger imutável **inclusive para o owner** |
-| `wallet_ledger_entries_validate` (constraint trigger, diferido) | INSERT, no COMMIT | encadeamento (`balance_before` = `balance_after` da versão anterior, versões contíguas, primeira linha parte de zero); existe mudança de saldo correspondente na wallet; transação `PROCESSED`; direção coerente com o tipo (LOSS nunca move dinheiro; ROLLBACK inverte a referência) |
-| `wallets_guard` | INSERT/UPDATE | identidade imutável; versão inicial 1; `balance` muda ⇔ `version` +1 exato |
-| `wallets_balance_change_has_ledger_entry` (diferido) | INSERT/UPDATE, no COMMIT | todo novo `(version, balance)` tem a linha de ledger com esse `balance_after` |
-| `wager_transactions_processed_has_ledger_entry` (diferido) | INSERT/UPDATE OF status | toda transação `PROCESSED` que move dinheiro tem sua linha de ledger |
-| `wager_transactions_guard` | UPDATE/DELETE/TRUNCATE | estados terminais imutáveis; identidade e conteúdo financeiro imutáveis; sem volta a PENDING; tentativas monotônicas; transações nunca apagadas |
-| `wager_transactions_validate_reference` | INSERT/UPDATE para PROCESSED | referência existe, está PROCESSED, é do mesmo provider/jogador/wallet/moeda/rodada, de tipo permitido e (em reversões) do mesmo valor |
-| `inbox_messages_guard` / `outbox_messages_guard` | UPDATE | inbox `PROCESSED` e outbox `PUBLISHED` imutáveis; conteúdo do evento imutável |
+| `wallet_ledger_entries_append_only` / `_no_truncate` | UPDATE/DELETE/TRUNCATE | immutable ledger, **even for the owner** |
+| `wallet_ledger_entries_validate` (constraint trigger, deferred) | INSERT, at COMMIT | chaining (`balance_before` = `balance_after` of the previous version, contiguous versions, first row starts from zero); a matching balance change exists in the wallet; transaction is `PROCESSED`; direction consistent with the kind (LOSS never moves money; ROLLBACK inverts the reference) |
+| `wallets_guard` | INSERT/UPDATE | immutable identity; initial version 1; `balance` changes ⇔ `version` +1 exactly |
+| `wallets_balance_change_has_ledger_entry` (deferred) | INSERT/UPDATE, at COMMIT | every new `(version, balance)` has the ledger row with that `balance_after` |
+| `wager_transactions_processed_has_ledger_entry` (deferred) | INSERT/UPDATE OF status | every `PROCESSED` transaction that moves money has its ledger row |
+| `wager_transactions_guard` | UPDATE/DELETE/TRUNCATE | immutable terminal states; immutable identity and financial content; no going back to PENDING; monotonic attempts; transactions never deleted |
+| `wager_transactions_validate_reference` | INSERT/UPDATE to PROCESSED | reference exists, is PROCESSED, belongs to the same provider/player/wallet/currency/round, has an allowed kind and (for reversals) the same amount |
+| `inbox_messages_guard` / `outbox_messages_guard` | UPDATE | inbox `PROCESSED` and outbox `PUBLISHED` are immutable; event content is immutable |
 
-Os erros levantam SQLSTATE 23514/23000 com `CONSTRAINT = <nome>`, e a aplicação os classifica como `IntegrityViolationError` (500, nunca retentado; ver `database-errors.ts`).
+The errors raise SQLSTATE 23514/23000 with `CONSTRAINT = <name>`, and the application classifies them as `IntegrityViolationError` (500, never retried; see `database-errors.ts`).
 
-**Sobre a igualdade saldo = soma do ledger.** Um `CHECK` simples não pode comparar tabelas diferentes, e esta solução não afirma que comparar. A igualdade decorre de três mecanismos complementares:
+**On the balance = ledger sum equality.** A plain `CHECK` cannot compare different tables, and this solution does not claim it does. The equality follows from three complementary mechanisms:
 
-1. **o protocolo transacional**: wallet e ledger são escritos no mesmo commit, sob o lock da wallet;
-2. **os triggers diferidos**: cada versão da wallet tem exatamente um lançamento cujo `balance_after` é o saldo daquela versão, a cadeia de lançamentos é contínua desde zero e a aritmética de cada lançamento é verificada. Por indução, o saldo atual é igual à soma dos lançamentos **enquanto os triggers estiverem ativos**;
-3. **a reconciliação** (`POST /wallets/:id/reconciliation`): verifica a igualdade de forma independente e detecta violações que contornem os triggers. Um superusuário pode desativá-los com `session_replication_role = replica`, e o teste `reconciliation.test.ts` faz exatamente isso para provar a detecção.
+1. **the transactional protocol**: wallet and ledger are written in the same commit, under the wallet lock;
+2. **the deferred triggers**: each wallet version has exactly one entry whose `balance_after` is the balance of that version, the chain of entries is continuous from zero, and the arithmetic of each entry is checked. By induction, the current balance equals the sum of the entries **as long as the triggers are enabled**;
+3. **reconciliation** (`POST /wallets/:id/reconciliation`): checks the equality independently and detects violations that bypass the triggers. A superuser can disable them with `session_replication_role = replica`, and the `reconciliation.test.ts` test does exactly that to prove detection.
 
-### Privilégios (migration `…0400`)
+### Privileges (migration `…0400`)
 
-Os serviços conectam com um login membro do grupo `wagering_app`, que tem apenas `SELECT/INSERT` no ledger, `SELECT/INSERT/UPDATE` nas demais tabelas e **nenhum** `DELETE`/`TRUNCATE`. As migrations rodam como owner. O teste `the runtime login has no UPDATE/DELETE privilege` verifica a recusa com `42501`.
+The services connect with a login that is a member of the `wagering_app` group, which has only `SELECT/INSERT` on the ledger, `SELECT/INSERT/UPDATE` on the other tables and **no** `DELETE`/`TRUNCATE`. The migrations run as the owner. The test `the runtime login has no UPDATE/DELETE privilege` checks the refusal with `42501`.
 
 ---
 
-## 4. O caminho financeiro: uma transação SQL
+## 4. The financial path: one SQL transaction
 
-`ProcessWagerTransactionUseCase` (HTTP e SQS) e `ResolvePendingReferenceUseCase` (worker) usam o mesmo `SettlementRecorder` e o mesmo serviço de domínio. Para uma operação nova, **um único COMMIT** contém:
+`ProcessWagerTransactionUseCase` (HTTP and SQS) and `ResolvePendingReferenceUseCase` (worker) use the same `SettlementRecorder` and the same domain service. For a new operation, **a single COMMIT** contains:
 
-1. `SELECT … FROM wallets WHERE id=$1 FOR UPDATE` (lock da linha da wallet);
-2. inbox: verificação por `(consumer_name, message_id)`, quando a origem é SQS;
-3. idempotência: busca por `(provider_id, idempotency_key)` e por `(provider_id, external_transaction_id)`;
-4. busca da referência e de reversões já existentes (sob o mesmo lock);
-5. decisão de domínio (status, saldo, lançamento);
-6. INSERT da `wager_transactions` com o **snapshot do resultado** (`result_balance_amount`, `result_wallet_version`);
-7. UPDATE da wallet (saldo + versão) e INSERT do lançamento, se houve efeito financeiro;
-8. INSERT dos eventos no outbox;
-9. INSERT/UPDATE da linha do inbox (SQS);
-10. "despertar" dependentes `PENDING_REFERENCE` da mesma wallet (`next_attempt_at = now`);
-11. `COMMIT`, quando os triggers diferidos e as FKs são verificados.
+1. `SELECT … FROM wallets WHERE id=$1 FOR UPDATE` (wallet row lock);
+2. inbox: check by `(consumer_name, message_id)`, when the source is SQS;
+3. idempotency: lookup by `(provider_id, idempotency_key)` and by `(provider_id, external_transaction_id)`;
+4. lookup of the reference and of existing reversals (under the same lock);
+5. domain decision (status, balance, entry);
+6. INSERT of the `wager_transactions` row with the **result snapshot** (`result_balance_amount`, `result_wallet_version`);
+7. UPDATE of the wallet (balance + version) and INSERT of the entry, if there was a financial effect;
+8. INSERT of the events into the outbox;
+9. INSERT/UPDATE of the inbox row (SQS);
+10. "wake up" `PENDING_REFERENCE` dependents of the same wallet (`next_attempt_at = now`);
+11. `COMMIT`, when the deferred triggers and FKs are checked.
 
-Nenhuma chamada de rede ao SQS acontece dentro dessa transação. Uma falha em qualquer etapa provoca ROLLBACK total, comprovado pelo teste `a failure after every write but before COMMIT leaves no partial state` com o fault point `wager.before-commit`.
+No network call to SQS happens inside this transaction. A failure at any step causes a full ROLLBACK, proven by the test `a failure after every write but before COMMIT leaves no partial state` with the fault point `wager.before-commit`.
 
-**Ordem de locks** (fixa em todos os caminhos): linha da `wallet` → linha da `wager_transaction` (worker) → linhas inseridas/atualizadas. Toda operação toca **uma única wallet**, porque a referência precisa pertencer à mesma wallet (garantido no domínio e pela FK composta). Por isso não existe aquisição de locks de várias wallets, nem o ciclo clássico de deadlock entre wallets.
+**Lock order** (fixed on every path): `wallet` row → `wager_transaction` row (worker) → inserted/updated rows. Every operation touches **a single wallet**, because the reference must belong to the same wallet (guaranteed in the domain and by the composite FK). So there is no acquisition of locks on multiple wallets, and no classic deadlock cycle between wallets.
 
 ---
 
 ## 5. ADRs
 
-### ADR-001 — Monólito modular em vez de microsserviços
+### ADR-001 — Modular monolith instead of microservices
 
-**Contexto.** As invariantes centrais (saldo, ledger, idempotência, inbox, outbox) precisam ser confirmadas **atomicamente**.
+**Context.** The core invariants (balance, ledger, idempotency, inbox, outbox) must be committed **atomically**.
 
-**Decisão.** Um único código de aplicação com módulos separados por camada e por responsabilidade, implantado como **vários processos** (API, consumidores, workers) sobre o **mesmo PostgreSQL**. Seis entrypoints, com imagem runtime compartilhada pelas APIs/workers e imagem separada para o job de migration.
+**Decision.** A single application codebase with modules separated by layer and by responsibility, deployed as **several processes** (API, consumers, workers) on top of the **same PostgreSQL**. Six entrypoints, with a runtime image shared by the APIs/workers and a separate image for the migration job.
 
-**Alternativas descartadas.** Microsserviços por entidade (wallet, transaction, ledger): exigiriam transações distribuídas (2PC) ou sagas com compensação para o que hoje é um COMMIT. Isso troca uma garantia forte por consistência eventual exatamente onde ela não é aceitável.
+**Alternatives ruled out.** Microservices per entity (wallet, transaction, ledger): they would require distributed transactions (2PC) or sagas with compensation for what is a single COMMIT today. That trades a strong guarantee for eventual consistency exactly where it is not acceptable.
 
-**Consequências.** Atomicidade trivial e verificável; código compartilhado entre entradas (HTTP/SQS/worker); escala horizontal por tipo de processo (`--scale`). O limite é o banco único (ADR-003). A **extração futura** é possível porque as fronteiras já existem: o outbox (`wager-events.fifo`) é a interface natural para extrair leitura/projeções, notificações ou relatórios sem tocar no núcleo financeiro.
+**Consequences.** Trivial, verifiable atomicity; code shared across inputs (HTTP/SQS/worker); horizontal scaling per process type (`--scale`). The limit is the single database (ADR-003). **Future extraction** is possible because the boundaries already exist: the outbox (`wager-events.fifo`) is the natural interface for extracting reads/projections, notifications or reporting without touching the financial core.
 
 ### ADR-002 — DDD + Hexagonal
 
-**Decisão.** Domínio puro (`src/domain`) com agregados que encapsulam as invariantes; aplicação (`src/application`) com use cases e **portas** (`UnitOfWork`, repositórios, `Clock`, `IdGenerator`, `EventPublisher`, `WageringMetrics`, `FaultInjector`); adaptadores em `src/infrastructure` (saída) e `src/interfaces` (entrada); composição em `src/bootstrap`.
+**Decision.** Pure domain (`src/domain`) with aggregates that encapsulate the invariants; application (`src/application`) with use cases and **ports** (`UnitOfWork`, repositories, `Clock`, `IdGenerator`, `EventPublisher`, `WageringMetrics`, `FaultInjector`); adapters in `src/infrastructure` (outbound) and `src/interfaces` (inbound); composition in `src/bootstrap`.
 
-- **Agregado `Wallet`**: única porta de mudança do saldo, e cada mudança devolve o lançamento. Como o saldo e o ledger nascem juntos, não é possível alterar um sem o outro dentro do domínio.
-- **Por que o domínio não depende do NestJS.** As regras financeiras são o ativo mais crítico e o que mais precisa de teste: os 143 testes unitários rodam em menos de 2s, sem framework. Frameworks mudam de versão major (NestJS 12 e MikroORM 7 saíram em 2026), e o domínio fica imune a isso. Os use cases também não usam decorators: o Nest só **expõe** os objetos já construídos (`CoreModule.register`), e testes de integração usam o mesmo composition root (`createCore`) sem Nest.
-- **Dependências permitidas** (verificadas por lint): domínio → nada externo (só `decimal.js`, que é uma biblioteca pura); aplicação → domínio e portas; adaptadores → tudo.
-- **Evitado de propósito**: interface para cada classe, camadas que só repassam chamadas, mediator/CQRS genérico. Há portas apenas onde existe mais de uma implementação real (testes × produção) ou onde há fronteira de I/O.
+- **`Wallet` aggregate**: the only way to change the balance, and every change returns the entry. Since balance and ledger are created together, one cannot be changed without the other inside the domain.
+- **Why the domain does not depend on NestJS.** The financial rules are the most critical asset and the one that most needs testing: the 143 unit tests run in under 2s, with no framework. Frameworks ship major versions (NestJS 12 and MikroORM 7 came out in 2026), and the domain is immune to that. The use cases do not use decorators either: Nest only **exposes** the already-built objects (`CoreModule.register`), and integration tests use the same composition root (`createCore`) without Nest.
+- **Allowed dependencies** (enforced by lint): domain → nothing external (only `decimal.js`, which is a pure library); application → domain and ports; adapters → everything.
+- **Deliberately avoided**: an interface for every class, pass-through layers, generic mediator/CQRS. Ports exist only where there is more than one real implementation (tests vs. production) or an I/O boundary.
 
-### ADR-003 — PostgreSQL como fonte da verdade
+### ADR-003 — PostgreSQL as the source of truth
 
-**Decisão.** O saldo materializado, o ledger, a idempotência, o inbox e o outbox vivem no PostgreSQL. Não há cache nem estado em memória que participe de alguma decisão.
+**Decision.** The materialized balance, the ledger, idempotency, the inbox and the outbox live in PostgreSQL. There is no cache or in-memory state that takes part in any decision.
 
-**Por quê.** ACID real: as escritas do caminho financeiro estão no mesmo COMMIT (seção 4). O isolamento é `READ COMMITTED` mais o lock de linha. Depois de adquirir o lock, cada `SELECT` vê os commits anteriores, então as verificações de idempotência e de saldo valem para o estado mais recente. A reconciliação usa `REPEATABLE READ READ ONLY` para ler wallet e ledger do **mesmo snapshot**, sem falsos alarmes sob escrita concorrente (teste `concurrent movements never produce a false divergence`). As constraints e os triggers da seção 3 tornam as invariantes independentes da aplicação.
+**Why.** Real ACID: the writes of the financial path are in the same COMMIT (section 4). Isolation is `READ COMMITTED` plus the row lock. After acquiring the lock, each `SELECT` sees previous commits, so the idempotency and balance checks apply to the latest state. Reconciliation uses `REPEATABLE READ READ ONLY` to read wallet and ledger from the **same snapshot**, with no false alarms under concurrent writes (test `concurrent movements never produce a false divergence`). The constraints and triggers in section 3 make the invariants independent of the application.
 
-**Limitações de um banco único.** É ponto único de falha (mitigável com réplica síncrona + failover gerenciado). O throughput de escrita é limitado a uma instância primária, e cada wallet é serializada (ADR-005). Particionar por wallet (sharding) seria o próximo passo, compatível com o modelo porque toda operação toca uma única wallet.
+**Limitations of a single database.** It is a single point of failure (mitigable with a synchronous replica + managed failover). Write throughput is limited to one primary instance, and each wallet is serialized (ADR-005). Partitioning by wallet (sharding) would be the next step, compatible with the model because every operation touches a single wallet.
 
-### ADR-004 — Money e precisão decimal
+### ADR-004 — Money and decimal precision
 
-**Decisão.** `Money` usa `decimal.js` (clone com 40 dígitos de precisão, bem acima do `NUMERIC(20,2)`, de modo que somas e subtrações são exatas). Entrada e saída são **strings** com escala fixa 2 (`"25.00"`), e a persistência usa `NUMERIC(20,2)` em colunas separadas de moeda, que o driver `pg` devolve como **texto**. Nenhum `number` toca dinheiro em nenhuma camada.
+**Decision.** `Money` uses `decimal.js` (a clone with 40 digits of precision, well above `NUMERIC(20,2)`, so additions and subtractions are exact). Input and output are **strings** with fixed scale 2 (`"25.00"`), and persistence uses `NUMERIC(20,2)` with separate currency columns, which the `pg` driver returns as **text**. No `number` touches money in any layer.
 
-- **Por que nunca float.** `0.1 + 0.2 ≠ 0.3` em IEEE-754, e o erro acumula. Os testes `0.10 + 0.20 is exactly 0.30` e `large values keep every cent` (18 dígitos inteiros) cobrem isso.
-- **Sem arredondamento implícito.** Entradas com mais de duas casas são **rejeitadas** (`25.001` → 400). Arredondar silenciosamente mudaria valores apostados.
-- **Validação em camadas.** O contrato zod (formato) e o `Money.from` (formato + moeda + faixa) validam a entrada. O banco aplica `NUMERIC(20,2)` e os `CHECK`s.
-- **Defesa extra.** `bun run check:money` usa o type checker do TypeScript para falhar o build se houver `parseFloat`, propriedades monetárias tipadas como `number`, aritmética com `number` em nomes monetários, `.toFixed` fora do `Money`, ou colunas `float/real/double/money` ou monetárias que não sejam `NUMERIC(20,2)`. Verifiquei com uma sonda contendo violações propositais que o check falha como esperado.
-- **Multi-moeda.** O domínio aceita moedas ISO-4217 com 2 casas decimais (BRL, USD, EUR…). A API aceita as de `ACCEPTED_CURRENCIES` (padrão `BRL`) para criar wallets. Conflitos de moeda são testados.
+- **Why never float.** `0.1 + 0.2 ≠ 0.3` in IEEE-754, and the error accumulates. The tests `0.10 + 0.20 is exactly 0.30` and `large values keep every cent` (18 integer digits) cover this.
+- **No implicit rounding.** Inputs with more than two decimal places are **rejected** (`25.001` → 400). Silently rounding would change wagered amounts.
+- **Layered validation.** The zod contract (format) and `Money.from` (format + currency + range) validate the input. The database enforces `NUMERIC(20,2)` and the `CHECK`s.
+- **Extra defense.** `bun run check:money` uses the TypeScript type checker to fail the build if there is any `parseFloat`, monetary properties typed as `number`, `number` arithmetic on monetary names, `.toFixed` outside `Money`, or `float/real/double/money` columns or monetary columns that are not `NUMERIC(20,2)`. I verified with a probe containing deliberate violations that the check fails as expected.
+- **Multi-currency.** The domain accepts ISO-4217 currencies with 2 decimal places (BRL, USD, EUR…). The API accepts those in `ACCEPTED_CURRENCIES` (default `BRL`) for creating wallets. Currency conflicts are tested.
 
-### ADR-005 — Concorrência por wallet: lock pessimista de linha
+### ADR-005 — Per-wallet concurrency: pessimistic row lock
 
-**Decisão.** A unidade de concorrência é a `walletId`. Cada operação adquire `SELECT … FOR UPDATE` na linha da wallet (MikroORM `LockMode.PESSIMISTIC_WRITE`), dentro de `em.transactional()`, e só então lê, decide e escreve. Antes, um *probe* com `FOR UPDATE SKIP LOCKED` (`PESSIMISTIC_PARTIAL_WRITE`) detecta, sem custo extra quando não há disputa, se a linha estava travada. Isso alimenta `wagering_wallet_lock_contention_total`.
+**Decision.** The unit of concurrency is the `walletId`. Each operation acquires `SELECT … FOR UPDATE` on the wallet row (MikroORM `LockMode.PESSIMISTIC_WRITE`), inside `em.transactional()`, and only then reads, decides and writes. Before that, a *probe* with `FOR UPDATE SKIP LOCKED` (`PESSIMISTIC_PARTIAL_WRITE`) detects, at no extra cost when there is no contention, whether the row was locked. This feeds `wagering_wallet_lock_contention_total`.
 
-**Por que não optimistic locking com retry.** Numa hot wallet, otimista significa ler, calcular, falhar na escrita e tentar de novo, com custo crescente e risco de esgotar retries sob disputa. O pessimista transforma disputa em fila ordenada, com espera limitada por `lock_timeout`.
+**Why not optimistic locking with retry.** On a hot wallet, optimistic means reading, computing, failing on write and trying again, with growing cost and the risk of exhausting retries under contention. Pessimistic turns contention into an ordered queue, with the wait bounded by `lock_timeout`.
 
-**Por que não mutex em memória.** Não funciona com várias instâncias e é perdido num crash. O teste `across three independent API processes` prova a correção entre processos de sistema operacional distintos.
+**Why not an in-memory mutex.** It does not work across multiple instances and is lost on a crash. The test `across three independent API processes` proves correctness across separate operating-system processes.
 
-**Por que não lock global.** Serializaria todas as wallets. O teste `different wallets never block each other` mostra que uma wallet travada não atrasa outra.
+**Why not a global lock.** It would serialize all wallets. The test `different wallets never block each other` shows that a locked wallet does not delay another.
 
-**Limites de espera.** Cada conexão é configurada com `lock_timeout=5s`, `statement_timeout=15s` e `idle_in_transaction_session_timeout=30s` (`orm.ts`). Transações curtas: só SQL, sem I/O externo.
+**Wait limits.** Each connection is configured with `lock_timeout=5s`, `statement_timeout=15s` and `idle_in_transaction_session_timeout=30s` (`orm.ts`). Short transactions: SQL only, no external I/O.
 
-**Deadlocks e retries.** Deadlock (`40P01`), falha de serialização (`40001`), lock timeout (`55P03`) e corrida em constraint única (`23505`) são erros **transitórios**. O `TransactionRetryExecutor` reexecuta a **unidade de trabalho inteira** (até 4 tentativas, backoff exponencial com jitter), recomeçando pela verificação de idempotência. Assim um retry nunca aplica uma operação duas vezes. O teste `a provoked deadlock is detected by PostgreSQL, retried from scratch and applied exactly once` cria um ciclo real e prova que o efeito é único.
+**Deadlocks and retries.** Deadlock (`40P01`), serialization failure (`40001`), lock timeout (`55P03`) and a unique-constraint race (`23505`) are **transient** errors. The `TransactionRetryExecutor` re-runs the **entire unit of work** (up to 4 attempts, exponential backoff with jitter), starting again from the idempotency check. That way a retry never applies an operation twice. The test `a provoked deadlock is detected by PostgreSQL, retried from scratch and applied exactly once` creates a real cycle and proves the effect is applied once.
 
-> **Lição registrada.** `lock_timeout` precisa ser maior que `deadlock_timeout` (1s). Caso contrário, uma espera que formaria um deadlock termina antes como *lock timeout*. Continua correto (também é transitório e reexecutado), mas o deadlock deixa de aparecer como tal nas métricas.
+> **Lesson learned.** `lock_timeout` must be greater than `deadlock_timeout` (1s). Otherwise, a wait that would form a deadlock ends first as a *lock timeout*. It is still correct (that is also transient and re-run), but the deadlock no longer shows up as such in the metrics.
 
-**Hot wallets: trade-off medido** ([docs/LOAD_TEST.md](docs/LOAD_TEST.md)). Com 15% do tráfego numa única wallet, ela atinge p50 de ~535ms, porque cada commit espera o anterior. Quem espera o lock **segura uma conexão do pool**, o que eleva a cauda de latência das demais wallets (p95 616ms × 184ms sem hot wallet). Mitigações, não necessárias para a correção: fila em memória por wallet em cada instância (*single-flight*, reduz conexões ociosas sem substituir o lock), pool dedicado, `lock_timeout` menor para falhar cedo com `503 LOCK_TIMEOUT`, ou sub-wallets.
+**Hot wallets: measured trade-off** ([docs/LOAD_TEST.md](docs/LOAD_TEST.md)). With 15% of the traffic on a single wallet, that wallet reaches a p50 of ~535ms, because each commit waits for the previous one. Whoever waits for the lock **holds a pool connection**, which raises the tail latency of the other wallets (p95 616ms vs. 184ms without a hot wallet). Mitigations, not needed for correctness: an in-memory per-wallet queue in each instance (*single-flight*, reduces idle connections without replacing the lock), a dedicated pool, a lower `lock_timeout` to fail early with `503 LOCK_TIMEOUT`, or sub-wallets.
 
-**Timestamps após o lock.** O instante da decisão é capturado **depois** do lock. Antes, uma versão N+1 podia ter timestamp anterior ao da versão N. O teste de carga revelou isso, e toda suíte agora verifica que o ledger é não-decrescente no tempo por versão. Contra pequenas diferenças de relógio entre instâncias, o `Wallet` também nunca data um movimento antes do anterior: usa o maior entre o "agora" da instância e o `updatedAt` atual. Isso preserva `updated_at >= created_at` e a ordem temporal do ledger.
+**Timestamps after the lock.** The decision instant is captured **after** the lock. Previously, version N+1 could have a timestamp earlier than version N. The load test revealed this, and every suite now checks that the ledger is non-decreasing in time per version. Against small clock differences between instances, `Wallet` also never dates a movement before the previous one: it uses the later of the instance's "now" and the current `updatedAt`. This preserves `updated_at >= created_at` and the temporal order of the ledger.
 
-### ADR-006 — Idempotência persistente
+### ADR-006 — Persistent idempotency
 
-**Decisão.** A própria linha de `wager_transactions` é o registro de idempotência, protegido por duas constraints únicas por provider: `(provider_id, idempotency_key)` e `(provider_id, external_transaction_id)`. O resultado original fica na mesma linha (`status`, `failure_code`, `result_balance_amount`, `result_wallet_version`, `processed_at`), gravado no mesmo commit do efeito financeiro.
+**Decision.** The `wager_transactions` row itself is the idempotency record, protected by two unique constraints per provider: `(provider_id, idempotency_key)` and `(provider_id, external_transaction_id)`. The original result lives in the same row (`status`, `failure_code`, `result_balance_amount`, `result_wallet_version`, `processed_at`), written in the same commit as the financial effect.
 
-- **Hash canônico.** `payloadHash = SHA-256(hex)` do JSON canônico (chaves ordenadas, sem espaços, opcionais ausentes omitidos, valor normalizado por `Money`) **somente** dos campos de negócio: `providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money{amount,currency}, referenceExternalTransactionId`. O header `Idempotency-Key`, o envelope SQS e qualquer metadado de transporte ficam fora. Por isso HTTP e SQS produzem o mesmo hash (`payload-hash.ts`, com vetor de teste fixo).
-- **Comportamentos.**
+- **Canonical hash.** `payloadHash = SHA-256(hex)` of the canonical JSON (sorted keys, no whitespace, absent optionals omitted, amount normalized by `Money`) of **only** the business fields: `providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind, money{amount,currency}, referenceExternalTransactionId`. The `Idempotency-Key` header, the SQS envelope and any transport metadata are left out. That is why HTTP and SQS produce the same hash (`payload-hash.ts`, with a fixed test vector).
+- **Behaviors.**
 
-  | Situação | Resultado |
+  | Situation | Result |
   |---|---|
-  | mesma chave + mesmo hash | **replay**: devolve o snapshot original (`idempotentReplay: true`) |
-  | mesma chave + hash diferente | `409 IDEMPOTENCY_KEY_CONFLICT`, sem efeito |
-  | mesmo `externalTransactionId`, outra chave | `409 DUPLICATE_EXTERNAL_TRANSACTION`, sem efeito |
-  | HTTP e depois SQS (ou o inverso) da mesma operação | o segundo é replay; um único efeito |
+  | same key + same hash | **replay**: returns the original snapshot (`idempotentReplay: true`) |
+  | same key + different hash | `409 IDEMPOTENCY_KEY_CONFLICT`, no effect |
+  | same `externalTransactionId`, different key | `409 DUPLICATE_EXTERNAL_TRANSACTION`, no effect |
+  | HTTP then SQS (or the reverse) for the same operation | the second one is a replay; a single effect |
 
-- **Saldo histórico.** O replay devolve o saldo **observado na operação original**, não o atual. O teste `identical replay returns the ORIGINAL result, including the historical balance` faz BET (saldo 80), depois WIN e outra BET, repete a BET e verifica 80.00.
-- **Replay enquanto pendente.** Se a operação original está `PENDING_REFERENCE`, o replay devolve `202` com o estado atual. Quando ela é liquidada pelo worker, o replay passa a devolver o resultado terminal, que a partir daí é imutável.
-- **Corridas.** Requisições simultâneas da mesma operação serializam no lock da wallet. A segunda, depois do lock, vê o commit da primeira e vira replay. Se duas requisições com a mesma chave apontarem para wallets **diferentes** (payload divergente), não há lock em comum. Nesse caso a constraint única decide: a perdedora recebe `23505`, o executor reexecuta a unidade e ela passa a ver a linha vencedora (→ `409`). Os testes `50 parallel calls`, `50 parallel HTTP requests spread over 3 API processes` e `HTTP (3 instances) AND SQS (3 consumer processes) at the same time` provam um único débito.
-- **Por que não cache em memória.** Restrição do desafio, e incorreto com várias instâncias e crashes.
+- **Historical balance.** The replay returns the balance **observed in the original operation**, not the current one. The test `identical replay returns the ORIGINAL result, including the historical balance` does a BET (balance 80), then a WIN and another BET, repeats the BET and checks 80.00.
+- **Replay while pending.** If the original operation is `PENDING_REFERENCE`, the replay returns `202` with the current state. Once it is settled by the worker, the replay returns the terminal result, which is immutable from then on.
+- **Races.** Concurrent requests for the same operation serialize on the wallet lock. The second one, after the lock, sees the first one's commit and becomes a replay. If two requests with the same key point to **different** wallets (divergent payload), there is no shared lock. In that case the unique constraint decides: the loser gets `23505`, the executor re-runs the unit and it then sees the winning row (→ `409`). The tests `50 parallel calls`, `50 parallel HTTP requests spread over 3 API processes` and `HTTP (3 instances) AND SQS (3 consumer processes) at the same time` prove a single debit.
+- **Why not an in-memory cache.** A constraint of the challenge, and incorrect with multiple instances and crashes.
 
-### ADR-007 — Ledger imutável, de entrada única
+### ADR-007 — Immutable, single-entry ledger
 
-**Decisão.** Ledger de entrada única: cada mudança de saldo gera uma linha com direção, valor, saldo anterior, saldo posterior e versão da wallet. É append-only no domínio (sem métodos de mutação), no repositório (só `append`), nos privilégios (sem UPDATE/DELETE) e nos triggers (nem o owner altera).
+**Decision.** Single-entry ledger: each balance change generates a row with direction, amount, previous balance, resulting balance and wallet version. It is append-only in the domain (no mutation methods), in the repository (only `append`), in the privileges (no UPDATE/DELETE) and in the triggers (not even the owner can change it).
 
-- **Auditoria.** A linha guarda `balance_before`, `balance_after` e `wallet_version`: qualquer saldo histórico é reconstituível e verificável linha a linha, sem refazer somas.
-- **Reversões por compensação.** REFUND e ROLLBACK geram **novos** lançamentos. Nada é apagado nem editado.
-- **Partidas dobradas.** É diferencial opcional e não foi implementado. O desenho permite acrescentá-lo (contas de contrapartida "casa"/"provider") sem mudar o protocolo.
-- **Limitação das constraints entre tabelas.** Ver a nota em §3: a igualdade saldo = soma vem de protocolo + triggers diferidos + reconciliação, não de um `CHECK`.
+- **Auditing.** The row stores `balance_before`, `balance_after` and `wallet_version`: any historical balance can be reconstructed and verified row by row, without recomputing sums.
+- **Reversals by compensation.** REFUND and ROLLBACK generate **new** entries. Nothing is deleted or edited.
+- **Double-entry bookkeeping.** It is an optional extra and was not implemented. The design allows adding it ("house"/"provider" counterparty accounts) without changing the protocol.
+- **Limitation of cross-table constraints.** See the note in §3: the balance = sum equality comes from protocol + deferred triggers + reconciliation, not from a `CHECK`.
 
 ### ADR-008 — Inbox
 
-**Decisão.** Tabela `inbox_messages` com chave `(consumer_name, message_id)` (o `messageId` do envelope), escrita **na mesma transação** do efeito financeiro, com o resultado (`outcome`: APPLIED, REPLAYED, CONFLICT, WALLET_NOT_FOUND, REJECTED; `transaction_id`; `result_code`) e o hash do payload.
+**Decision.** An `inbox_messages` table keyed by `(consumer_name, message_id)` (the envelope's `messageId`), written **in the same transaction** as the financial effect, with the result (`outcome`: APPLIED, REPLAYED, CONFLICT, WALLET_NOT_FOUND, REJECTED; `transaction_id`; `result_code`) and the payload hash.
 
-- **Garantia real.** O efeito financeiro e o registro "mensagem processada" são atômicos: ou os dois existem, ou nenhum. Uma reentrega encontra o inbox e é respondida sem reprocessar (`DUPLICATE_MESSAGE` → ack). O mesmo `messageId` com outro payload vai para a DLQ (`MESSAGE_ID_CONFLICT`).
-- **Ack depois do commit.** `DeleteMessage` só é chamado depois do COMMIT. Se o processo morrer entre os dois, a mensagem volta após o *visibility timeout* e o inbox a absorve. O teste `consumer killed AFTER the commit and BEFORE the ack` mata o processo com SIGKILL nesse ponto exato e verifica um único débito e `wagering_inbox_duplicates_total = 1` no novo consumidor.
-- **Falha no DeleteMessage.** É registrada (`wagering_sqs_delete_failures_total`) e tratada igual ao caso anterior.
-- **Escopo.** O inbox deduplica **mensagens**; a idempotência de negócio (ADR-006) deduplica **operações**. Mensagens diferentes com a mesma operação viram replays, cada uma com sua linha no inbox.
+- **Real guarantee.** The financial effect and the "message processed" record are atomic: either both exist or neither does. A redelivery finds the inbox row and is answered without reprocessing (`DUPLICATE_MESSAGE` → ack). The same `messageId` with a different payload goes to the DLQ (`MESSAGE_ID_CONFLICT`).
+- **Ack after commit.** `DeleteMessage` is only called after the COMMIT. If the process dies between the two, the message comes back after the *visibility timeout* and the inbox absorbs it. The test `consumer killed AFTER the commit and BEFORE the ack` kills the process with SIGKILL at that exact point and checks a single debit and `wagering_inbox_duplicates_total = 1` on the new consumer.
+- **DeleteMessage failure.** It is recorded (`wagering_sqs_delete_failures_total`) and handled the same way as the previous case.
+- **Scope.** The inbox deduplicates **messages**; business idempotency (ADR-006) deduplicates **operations**. Different messages carrying the same operation become replays, each with its own inbox row.
 
 ### ADR-009 — Transactional Outbox
 
-**Decisão.** Os eventos são inseridos em `outbox_messages` **no mesmo commit** da operação. Publishers independentes (2 réplicas) fazem:
+**Decision.** Events are inserted into `outbox_messages` **in the same commit** as the operation. Independent publishers (2 replicas) do:
 
-1. **claim** numa transação curta: `WITH due AS (SELECT … WHERE status='PENDING' AND next_attempt_at <= now AND (claim_expires_at IS NULL OR claim_expires_at < now) ORDER BY seq LIMIT n FOR UPDATE SKIP LOCKED) UPDATE … SET claimed_by, claim_expires_at = now + lease, attempts = attempts + 1`, seguido de **COMMIT**;
-2. **publicação** no SQS **sem nenhuma transação ou lock aberto** (`SendMessageBatch`, `MessageDeduplicationId = eventId`, `MessageGroupId = walletId`);
-3. **confirmação** em outra transação curta: `PUBLISHED`, independente de quem detém o lease, porque a publicação já aconteceu. Nas falhas, `next_attempt_at` com backoff exponencial e jitter persistido, condicionado a ainda ser o dono do lease. Após `OUTBOX_MAX_ATTEMPTS` (15) o evento fica `DEAD`: retido para intervenção, nunca descartado (alerta `OutboxDeadEvents`).
+1. **claim** in a short transaction: `WITH due AS (SELECT … WHERE status='PENDING' AND next_attempt_at <= now AND (claim_expires_at IS NULL OR claim_expires_at < now) ORDER BY seq LIMIT n FOR UPDATE SKIP LOCKED) UPDATE … SET claimed_by, claim_expires_at = now + lease, attempts = attempts + 1`, followed by **COMMIT**;
+2. **publish** to SQS **with no open transaction or lock** (`SendMessageBatch`, `MessageDeduplicationId = eventId`, `MessageGroupId = walletId`);
+3. **confirm** in another short transaction: `PUBLISHED`, regardless of who holds the lease, because the publish has already happened. On failure, `next_attempt_at` with persisted exponential backoff and jitter, conditional on still owning the lease. After `OUTBOX_MAX_ATTEMPTS` (15) the event becomes `DEAD`: retained for intervention, never discarded (alert `OutboxDeadEvents`).
 
-- **SKIP LOCKED + lease.** Publishers concorrentes pegam lotes disjuntos (teste `two concurrent publishers: … every event published exactly once`, com 60 eventos). O lease sobrevive ao commit do claim. Se o publisher morre, o lease expira e outro assume.
-- **At-least-once, não exactly-once.** O teste `outbox publisher killed AFTER publishing and BEFORE confirming` mata o processo nesse ponto: o evento está no SQS e o banco ainda diz `PENDING`. Após o lease, outro publisher republica com o **mesmo eventId**. Dentro da janela de deduplicação do SQS FIFO (5 min) a cópia é descartada; fora dela, o consumidor deduplica por `eventId`, demonstrado com o próprio mecanismo de inbox (`downstream-projection`). Um evento confirmado **nunca** é perdido.
-- **Nunca antes do commit.** Uma falha antes do COMMIT não deixa evento nenhum (teste `events are never visible before the financial commit`).
-- **Ordenação.** Com publishers concorrentes, eventos de uma mesma wallet em lotes diferentes podem chegar fora de ordem. Os eventos trazem `walletVersion` e `occurredAt` para o consumidor ordenar ou descartar versões antigas. Ordenação estrita exigiria "um evento em voo por grupo", com *head-of-line blocking*, e não foi adotada.
+- **SKIP LOCKED + lease.** Concurrent publishers take disjoint batches (test `two concurrent publishers: … every event published exactly once`, with 60 events). The lease survives the claim's commit. If the publisher dies, the lease expires and another one takes over.
+- **At-least-once, not exactly-once.** The test `outbox publisher killed AFTER publishing and BEFORE confirming` kills the process at that point: the event is in SQS and the database still says `PENDING`. After the lease, another publisher republishes with the **same eventId**. Within the SQS FIFO deduplication window (5 min) the copy is discarded; outside it, the consumer deduplicates by `eventId`, demonstrated with the inbox mechanism itself (`downstream-projection`). A committed event is **never** lost.
+- **Never before the commit.** A failure before the COMMIT leaves no event at all (test `events are never visible before the financial commit`).
+- **Bounded attempts, even when the worker dies.** Every claim counts as an attempt. An event whose publication keeps killing its worker never gets a recorded outcome, so `scheduleRetry` alone would never mark it `DEAD` and it would be republished forever. Before claiming, each publisher therefore retires as `DEAD` the events whose attempts are exhausted and whose last lease expired without an outcome (`retireAbandoned`, same alert `OUTBOX_EVENT_DEAD`). An event requeued by an operator has no lease and gets a new attempt. Test: `a publication that keeps dying before its confirmation is retained as DEAD after max attempts, not republished forever`.
+- **Lease vs. publication time.** The lease (30s) can be shorter than the worst case of a slow broker (a 50-event batch is up to 5 `SendMessageBatch` calls, each with SDK retries). Another publisher may then republish part of a batch that is still in flight. The copy carries the same `eventId` as `MessageDeduplicationId`, so SQS FIFO drops it inside its 5-minute window; the only side effect is an extra counted attempt.
+- **Ordering.** With concurrent publishers, events for the same wallet in different batches may arrive out of order. Events carry `walletVersion` and `occurredAt` so the consumer can order them or discard old versions. Strict ordering would require "one in-flight event per group", with *head-of-line blocking*, and was not adopted.
 
 ### ADR-010 — SQS FIFO
 
-**Decisão.** Filas `wager-transactions.fifo` (com `RedrivePolicy` → `wager-transactions-dlq.fifo`, `maxReceiveCount=100` como rede de segurança) e `wager-events.fifo`, criadas de forma idempotente pelo job `queue-bootstrap` (`DeduplicationScope=messageGroup`, `FifoThroughputLimit=perMessageGroupId`). O `MessageGroupId` recomendado é o `walletId`.
+**Decision.** Queues `wager-transactions.fifo` (with `RedrivePolicy` → `wager-transactions-dlq.fifo`, `maxReceiveCount=100` as a safety net) and `wager-events.fifo`, created idempotently by the `queue-bootstrap` job (`DeduplicationScope=messageGroup`, `FifoThroughputLimit=perMessageGroupId`). The recommended `MessageGroupId` is the `walletId`.
 
-- **Ordenação por wallet** reduz contenção e preserva a ordem do provider dentro da wallet. O consumidor processa mensagens do mesmo grupo **em sequência** e grupos diferentes **em paralelo**. Se uma mensagem do grupo falha, as seguintes do mesmo lote são adiadas para manter a ordem, sem gastar tentativas delas (ver abaixo).
-- **O banco continua sendo a garantia.** FIFO e deduplicação do SQS são **otimizações**: a deduplicação vale só por 5 minutos e por `MessageDeduplicationId`, e não protege de reentregas após o visibility timeout nem de produtores que geram ids diferentes. Os testes enviam deliberadamente a mesma mensagem com ids de deduplicação diferentes, e o inbox/idempotência mantém um único efeito.
-- **Classificação de erros no consumidor.**
+- **Per-wallet ordering** reduces contention and preserves the provider's order within the wallet. The consumer processes messages of the same group **sequentially** and different groups **in parallel**. If a message in the group fails, the following ones in the same batch are deferred to keep the order, without spending their attempts (see below).
+- **The database is still the guarantee.** SQS FIFO and deduplication are **optimizations**: deduplication only lasts 5 minutes and works per `MessageDeduplicationId`, and it does not protect against redeliveries after the visibility timeout or against producers that generate different ids. The tests deliberately send the same message with different deduplication ids, and the inbox/idempotency keeps a single effect.
+- **Error classification in the consumer.**
 
-  | Classe | Exemplo | Ação |
+  | Class | Example | Action |
   |---|---|---|
-  | negócio | REJECTED, conflito, wallet inexistente | registra no inbox, **ack** |
-  | transitório | `DATABASE_UNAVAILABLE`, `LOCK_TIMEOUT` | **sem ack**; falha contada em `inbox_attempts`; `ChangeMessageVisibility` com backoff exponencial + jitter (1s → 60s); após `CONSUMER_MAX_ATTEMPTS` (5) tentativas o consumidor envia para a DLQ (`PROCESSING_FAILED`, com `errorCode`) e marca `DEAD_LETTERED` no inbox |
-  | permanente | JSON inválido, contrato violado (ex.: `kind: OPENING`), `messageId` reutilizado | envio **explícito** para a DLQ (com motivo nos atributos) + linha `DEAD_LETTERED` no inbox, se possível |
-  | inesperado | bug | como o transitório: retry até `CONSUMER_MAX_ATTEMPTS`, depois DLQ (`PROCESSING_FAILED`) |
+  | business | REJECTED, conflict, nonexistent wallet | record in the inbox, **ack** |
+  | transient | `DATABASE_UNAVAILABLE`, `LOCK_TIMEOUT` | **no ack**; failure counted in `inbox_attempts`; `ChangeMessageVisibility` with exponential backoff + jitter (1s → 60s); after `CONSUMER_MAX_ATTEMPTS` (5) attempts the consumer sends it to the DLQ (`PROCESSING_FAILED`, with `errorCode`) and marks `DEAD_LETTERED` in the inbox |
+  | permanent | invalid JSON, violated contract (e.g. `kind: OPENING`), reused `messageId` | **explicit** send to the DLQ (with the reason in the attributes) + `DEAD_LETTERED` inbox row, if possible |
+  | unexpected | bug | same as transient: retry up to `CONSUMER_MAX_ATTEMPTS`, then DLQ (`PROCESSING_FAILED`) |
 
-- **O orçamento de tentativas é por mensagem e persistente, não o `ApproximateReceiveCount`.** Num grupo FIFO, as mensagens atrás de uma cabeça que falha voltam junto com ela a cada retry e são adiadas sem processamento: o contador de recebimentos delas sobe sem nenhuma tentativa. Com o redrive do SQS como limite, essas mensagens iriam para a DLQ sem nunca terem sido processadas. Por isso cada falha real é contada em `inbox_attempts`, numa transação curta própria (a que falhou sofreu rollback), e o consumidor decide a DLQ por esse contador. O redrive do SQS (`SQS_MAX_RECEIVE_COUNT=100`, validado como `>= CONSUMER_MAX_ATTEMPTS × SQS_MAX_MESSAGES`) fica só como rede de segurança para falhas que o consumidor não consegue contar, como uma mensagem que derruba o processo. Ao ir para a DLQ, o contador é zerado: um redrive manual recomeça com o orçamento completo. Teste: `messages behind a failing FIFO group head keep their own budget`.
+- **The attempt budget is per message and persistent, not `ApproximateReceiveCount`.** In a FIFO group, the messages behind a failing head come back with it on every retry and are deferred without being processed: their receive count goes up without any attempt. With the SQS redrive as the limit, those messages would go to the DLQ without ever being processed. That is why each real failure is counted in `inbox_attempts`, in its own short transaction (the one that failed was rolled back), and the consumer decides on the DLQ based on that counter. The SQS redrive (`SQS_MAX_RECEIVE_COUNT=100`, validated as `>= CONSUMER_MAX_ATTEMPTS × SQS_MAX_MESSAGES`) remains only as a safety net for failures the consumer cannot count, such as a message that crashes the process. When a message goes to the DLQ, the counter is reset: a manual redrive starts over with the full budget. Test: `messages behind a failing FIFO group head keep their own budget`.
 
-- **Queda do banco não esgota tentativas.** No primeiro `DATABASE_UNAVAILABLE` o consumidor **pausa o consumo** (métrica `wagering_sqs_consumer_paused = 1`) e sonda o PostgreSQL (`SELECT 1`) com backoff até 5s. Só volta a buscar mensagens quando o banco responde. Sem isso, com 5 tentativas e backoff de 1s a 60s, uma queda de ~30s mandaria a mensagem da cabeça de cada grupo para a DLQ, e o grupo FIFO desbloqueado deixaria passar as mensagens seguintes (um REFUND, por exemplo) fora de ordem. Teste: `a database outage longer than the retry budget pauses consumption instead of dead-lettering`. Durante a pausa, `DATABASE_UNAVAILABLE` não gasta tentativas. Erros transitórios **por wallet** (como `LOCK_TIMEOUT`) não pausam o consumidor e consomem o orçamento normal.
-- **Visibilidade.** O *visibility timeout* é configurável (30s). Um heartbeat estende a visibilidade a cada metade do timeout enquanto a mensagem é processada.
-- **Shutdown gracioso.** No SIGTERM o consumidor para de buscar, conclui as mensagens em andamento e devolve imediatamente (`VisibilityTimeout=0`) as recebidas e não iniciadas. **O long poll em curso não é abortado**: abortar um `ReceiveMessage` que o SQS já respondeu torna as mensagens invisíveis e consome uma de suas tentativas sem que ninguém as processe. Os testes de integração detectaram exatamente esse defeito numa versão anterior (mensagens indo para a DLQ antes da hora), e a correção reduziu de ~6s para ~1s o tempo dos testes do consumidor. O long poll termina em até `WaitTimeSeconds` (20s), dentro do `stop_grace_period` de 30s.
+- **A database outage does not exhaust attempts.** On the first `DATABASE_UNAVAILABLE` the consumer **pauses consumption** (metric `wagering_sqs_consumer_paused = 1`) and probes PostgreSQL (`SELECT 1`) with backoff up to 5s. It only fetches messages again once the database responds. Without this, with 5 attempts and a 1s to 60s backoff, an outage of ~30s would send the head message of every group to the DLQ, and the unblocked FIFO group would let the following messages (a REFUND, for example) through out of order. Test: `a database outage longer than the retry budget pauses consumption instead of dead-lettering`. During the pause, `DATABASE_UNAVAILABLE` does not spend attempts. **Per-wallet** transient errors (such as `LOCK_TIMEOUT`) do not pause the consumer and consume the normal budget.
+- **Visibility.** The *visibility timeout* is configurable (30s). A heartbeat extends the visibility every half timeout while the message is being processed.
+- **Graceful shutdown.** On SIGTERM the consumer stops fetching, finishes the in-flight messages and immediately returns (`VisibilityTimeout=0`) the ones received but not started. **The ongoing long poll is not aborted**: aborting a `ReceiveMessage` that SQS has already answered makes the messages invisible and consumes one of their attempts without anyone processing them. The integration tests caught exactly this defect in an earlier version (messages going to the DLQ prematurely), and the fix reduced the consumer test time from ~6s to ~1s. The long poll ends within `WaitTimeSeconds` (20s), inside the 30s `stop_grace_period`.
 
-### ADR-011 — Referências fora de ordem
+### ADR-011 — Out-of-order references
 
-**Decisão.** REFUND/ROLLBACK (e WIN/LOSS com referência) cuja referência não existe, ou ainda não está terminal, são **persistidos** como `PENDING_REFERENCE`, emitem `WagerTransactionPendingReference`, **não movimentam** a wallet e recebem `next_attempt_at` e `reference_expires_at`. O `PendingReferenceWorker`:
+**Decision.** REFUND/ROLLBACK (and WIN/LOSS with a reference) whose reference does not exist, or is not yet terminal, are **persisted** as `PENDING_REFERENCE`, emit `WagerTransactionPendingReference`, **do not move** the wallet and get `next_attempt_at` and `reference_expires_at`. The `PendingReferenceWorker`:
 
-1. faz claim dos devidos com `FOR UPDATE SKIP LOCKED` + lease (transação curta);
-2. para cada um, numa transação: lock da **wallet**, depois lock da **transação** (mesma ordem do caminho principal), confere se ainda está `PENDING_REFERENCE` e se está devida, e chama o **mesmo** `SettlementRecorder`/`WagerSettlementService` do fluxo normal.
+1. claims the due ones with `FOR UPDATE SKIP LOCKED` + lease (short transaction);
+2. for each one, in a transaction: locks the **wallet**, then the **transaction** (same order as the main path), checks that it is still `PENDING_REFERENCE` and still due, and calls the **same** `SettlementRecorder`/`WagerSettlementService` as the normal flow.
 
-- **Backoff.** `2s × 2^tentativas`, limitado a 5 min, até **10 tentativas** ou **TTL de 1h**, o que vier primeiro (com os padrões, as tentativas esgotam em ~18 min). Ao esgotar: `REJECTED REFERENCE_NOT_FOUND` + `WagerTransactionRejected`. Erros inesperados repetidos acabam como `FAILED REFERENCE_RESOLUTION_FAILED` (auditável, terminal). Tudo é configurável (`REFERENCE_*`) e testado com `Clock` injetável (`ManualClock`), sem esperas reais.
-- **Reação imediata.** Quando a referência é liquidada, os dependentes da mesma wallet têm `next_attempt_at` antecipado para "agora" na mesma transação. O worker os resolve no próximo ciclo (~1s), sem esperar o backoff. Encadeamentos (ROLLBACK → REFUND → BET) resolvem em cascata.
-- **Concorrência.** Várias instâncias são seguras: o claim distribui lotes disjuntos e a liquidação reconfere o status sob o lock. O teste `competing worker instances …` executa cada claim **duas vezes em paralelo** por instâncias diferentes e verifica exatamente 8 tentativas efetivas e 8 descartadas. Com 8 REFUNDs para a mesma BET, apenas 1 é aplicado e os outros 7 recebem `REFERENCE_ALREADY_REVERSED`.
-- **Ambiguidade REFUND × ROLLBACK.** Ver §8: no máximo uma reversão bem-sucedida por transação, garantida também pelo índice único parcial.
+- **Backoff and limits.** `2s × 2^attempts`, capped at 5 min, until the **1h TTL** expires; **20 attempts** is only a safety cap (with the defaults they would last ~68 min, so the TTL is the limit that applies). Why these values: the TTL is the business window in which a provider is expected to deliver the referenced operation (it normally follows within seconds; one hour absorbs provider retries and outages on their side), after which a person should investigate. The backoff cap of 5 min bounds how late a reference that arrives without waking its dependents is noticed, and keeps the worker's load per stuck transaction at ≤ 12 queries per hour. A reference that does arrive wakes its dependents immediately (`wakeDependents`), so the backoff never delays the normal out-of-order case. When exhausted: `REJECTED REFERENCE_NOT_FOUND` + `WagerTransactionRejected`. Repeated unexpected errors end up as `FAILED REFERENCE_RESOLUTION_FAILED` (auditable, terminal). Everything is configurable (`REFERENCE_*`) and tested with an injectable `Clock` (`ManualClock`), with no real waiting.
+- **Immediate reaction.** When the reference is settled, the dependents in the same wallet have their `next_attempt_at` moved up to "now" in the same transaction. The worker resolves them on the next cycle (~1s), without waiting for the backoff. Chains (ROLLBACK → REFUND → BET) resolve in cascade.
+- **Concurrency.** Multiple instances are safe: the claim hands out disjoint batches and settlement rechecks the status under the lock. The test `competing worker instances …` runs each claim **twice in parallel** from different instances and checks exactly 8 effective attempts and 8 discarded ones. With 8 REFUNDs for the same BET, only 1 is applied and the other 7 get `REFERENCE_ALREADY_REVERSED`.
+- **REFUND vs. ROLLBACK ambiguity.** See §8: at most one successful reversal per transaction, also guaranteed by the partial unique index.
 
-### ADR-012 — HTTP e erros
+### ADR-012 — HTTP and errors
 
-**Decisão.** Formato único de erro `{ code, message, correlationId, retryable, details? }`, em que `code` e `retryable` são o contrato de máquina e `message` serve só para humanos. Mapeamento consistente em todos os endpoints (`http-errors.ts`):
+**Decision.** A single error format `{ code, message, correlationId, retryable, details? }`, where `code` and `retryable` are the machine contract and `message` is only for humans. Consistent mapping across all endpoints (`http-errors.ts`):
 
-| Status | Quando | `retryable` |
+| Status | When | `retryable` |
 |---|---|---|
-| `201` | transação PROCESSED na primeira vez; wallet criada | — |
-| `200` | replay de PROCESSED; consultas; reconciliação | — |
-| `202` | `PENDING_REFERENCE` (primeira vez ou replay); `Location` para consultar | — |
-| `400` | payload/parâmetro inválido (`VALIDATION_ERROR`, `INVALID_MONEY`, `UNSUPPORTED_CURRENCY`…), JSON malformado, `Idempotency-Key` ausente | false |
-| `403` | provider não autorizado (`PROVIDER_FORBIDDEN`, ponto de extensão de auth) | false |
-| `404` | recurso inexistente (`WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `ROUTE_NOT_FOUND`) | false |
+| `201` | transaction PROCESSED the first time; wallet created | — |
+| `200` | replay of PROCESSED; queries; reconciliation | — |
+| `202` | `PENDING_REFERENCE` (first time or replay); `Location` to poll | — |
+| `400` | invalid payload/parameter (`VALIDATION_ERROR`, `INVALID_MONEY`, `UNSUPPORTED_CURRENCY`…), malformed JSON, missing `Idempotency-Key` | false |
+| `403` | provider not authorized (`PROVIDER_FORBIDDEN`, auth extension point) | false |
+| `404` | nonexistent resource (`WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND`, `ROUTE_NOT_FOUND`) | false |
 | `409` | `WALLET_ALREADY_EXISTS`, `IDEMPOTENCY_KEY_CONFLICT`, `DUPLICATE_EXTERNAL_TRANSACTION` (`details.existingTransactionId`) | false |
-| `422` | rejeição de regra de negócio: `code = failureCode`, mais `transactionId`, `status`, `balance` e `idempotentReplay` | false |
-| `500` | `FAILED` (terminal) ou erro inesperado/violação de integridade (sem detalhes internos) | false |
+| `422` | business rule rejection: `code = failureCode`, plus `transactionId`, `status`, `balance` and `idempotentReplay` | false |
+| `500` | `FAILED` (terminal) or unexpected error/integrity violation (no internal details) | false |
 | `503` | `DATABASE_UNAVAILABLE`, `LOCK_TIMEOUT`, `CONCURRENCY_CONFLICT`, `STATEMENT_TIMEOUT`; header `Retry-After: 1` | **true** |
 
-Repetir é **sempre seguro** por causa da idempotência. `retryable: true` indica que a repetição deve dar resultado diferente. Uma wallet inexistente numa transação gera `404` sem persistência, porque a FK exige a wallet. Pelo SQS o resultado fica registrado no inbox. O teste `PostgreSQL unavailable: 503 retryable + not ready (live stays up), then automatic recovery` bloqueia conexões ao banco de verdade.
+Retrying is **always safe** thanks to idempotency. `retryable: true` indicates that a retry should yield a different result. A nonexistent wallet in a transaction produces `404` with no persistence, because the FK requires the wallet. Via SQS the result is recorded in the inbox. The test `PostgreSQL unavailable: 503 retryable + not ready (live stays up), then automatic recovery` actually blocks connections to the database.
 
-### ADR-013 — Observabilidade e recuperação
+### ADR-013 — Observability and recovery
 
-- **Logs JSON** (pino) com `service`, `instanceId` e o contexto propagado por `AsyncLocalStorage`: `correlationId` (header `X-Correlation-Id` ou gerado, devolvido na resposta e nos eventos), `requestId`, `messageId`, `transactionId`, `walletId`, `providerId`. Corpos de requisição/mensagem nunca são logados, e chaves sensíveis são redigidas. Linhas de alerta carregam `alert` (`RECONCILIATION_DIVERGENCE`, `MESSAGE_DEAD_LETTERED`, `OUTBOX_EVENT_DEAD`).
-- **Métricas Prometheus** (por instância, `/metrics`; bloqueado no nginx): transações por kind/status/canal, replays, conflitos, duplicatas do inbox, retries por motivo, espera e contenção de lock, lock timeouts, deadlocks, latência dos use cases e do HTTP, mensagens recebidas/ack/retry/DLQ, falhas de `DeleteMessage`, profundidade da DLQ, pendências e **lag** do outbox, eventos `DEAD`, atraso commit→publicação, backlog e **lag** de referências pendentes, reconciliações e divergências.
-- **Health.** `/health/live` indica só que o processo responde. `/health/ready` verifica PostgreSQL (`SELECT 1`) e SQS (`GetQueueAttributes`) com timeout de 2s. Se o banco cai, a instância fica *not ready* (503) mas viva, sem reinício em loop, e volta sozinha.
-- **Reconciliação** sob demanda, só leitura, `REPEATABLE READ`: compara saldo × Σ ledger, versão × última linha e a continuidade da cadeia. Divergências são logadas, contadas e alertadas, **nunca corrigidas automaticamente**.
-- **Perfil `observability`.** Prometheus descobre cada réplica via DNS do Docker (verificado: 9 alvos `up`). Grafana vem com dashboard provisionado e regras de alerta (`infra/monitoring/prometheus/alerts.yml`).
-- **Diagnóstico.** `correlationId` liga a requisição HTTP, os logs de todas as instâncias e os eventos publicados. O inbox registra o resultado de cada mensagem, e o outbox, as tentativas e o último erro.
-- **OpenTelemetry/Jaeger.** Não incluídos: a auto-instrumentação do OTel depende de hooks de módulo do Node que não são confiáveis no Bun. O `correlationId` cobre a necessidade de rastreio deste escopo.
+- **JSON logs** (pino) with `service`, `instanceId` and context propagated via `AsyncLocalStorage`: `correlationId` (the `X-Correlation-Id` header or generated, returned in the response and in the events), `requestId`, `messageId`, `transactionId`, `walletId`, `providerId`. Request/message bodies are never logged, and sensitive keys are redacted. Alert lines carry `alert` (`RECONCILIATION_DIVERGENCE`, `MESSAGE_DEAD_LETTERED`, `OUTBOX_EVENT_DEAD`).
+- **Database errors never leak row values.** Driver messages quote the SQL bindings and PostgreSQL's `detail` ("Failing row contains (…)"): player ids, amounts, idempotency keys. The unit of work translates every database error into an application error whose message names only the SQLSTATE and the constraint (`IntegrityViolationError`, `UnexpectedDatabaseError`); the original stays in `cause`, which is never logged. knex also runs with `compileSqlOnError: false`. Test: `database errors never carry SQL bindings or row values into what gets logged`.
+- **Prometheus metrics** (per instance, `/metrics`; blocked at nginx): transactions by kind/status/channel, replays, conflicts, inbox duplicates, retries by reason, lock wait and contention, lock timeouts, deadlocks, use case and HTTP latency, messages received/acked/retried/DLQ'd, `DeleteMessage` failures, DLQ depth, outbox pending count and **lag**, `DEAD` events, commit→publish delay, pending reference backlog and **lag**, reconciliations and divergences.
+- **Health.** `/health/live` only indicates that the process responds. `/health/ready` checks PostgreSQL (`SELECT 1`) and SQS (`GetQueueAttributes`) with a 2s timeout. If the database goes down, the instance becomes *not ready* (503) but stays alive, with no restart loop, and recovers on its own.
+- **Reconciliation** on demand, read-only, `REPEATABLE READ`: compares balance vs. Σ ledger, version vs. last row, and chain continuity. Divergences are logged, counted and alerted, **never corrected automatically**.
+- **`observability` profile.** Prometheus discovers each replica via Docker DNS (verified: 9 targets `up`). Grafana ships with a provisioned dashboard and alert rules (`infra/monitoring/prometheus/alerts.yml`).
+- **Diagnostics.** `correlationId` ties together the HTTP request, the logs of all instances and the published events. The inbox records the result of each message, and the outbox records the attempts and the last error.
+- **OpenTelemetry/Jaeger.** Not included: OTel auto-instrumentation relies on Node module hooks that are not reliable on Bun. The `correlationId` covers the tracing needs of this scope.
 
-### ADR-014 — Docker e infraestrutura
+### ADR-014 — Docker and infrastructure
 
-- **Imagens multi-stage** (`infra/docker/Dockerfile`): `deps` (lockfile congelado e patches locais) → `dev` (toolbox de testes) → `build` (`tsc`) → `prod-deps` → `runtime` (`oven/bun:1.4.3-slim`, usuário **não-root** `bun`, apenas `dist/` + dependências de produção). O target `migration-runtime` acrescenta as ferramentas de migration e é usado apenas pelo job owner. O ORM carrega o migrator e a lista de migrations dinamicamente quando `withMigrator=true`; APIs e workers não carregam essas dependências.
-- **API e workers separados.** Cada processo roda um único papel (sem workers escondidos dentro da API), o que permite escalar e dimensionar pools de conexão de forma independente (api 10, consumer 5, outbox 3, reference 3; `max_connections=200`).
-- **Inicialização ordenada.** `postgres` e `localstack` healthy → jobs `migrations` e `queue-bootstrap` (`service_completed_successfully`) → `api`/workers (healthy via `/health/ready`) → `nginx`. `init: true` (sinais corretos), `stop_grace_period: 30s`, `restart: unless-stopped`.
-- **Redes.** `edge` (nginx + api) e `backend` (`internal: true`: banco, broker, workers sem rota externa). Só o nginx publica porta (`8080`, ou `API_PUBLIC_PORT`).
-- **nginx.** `server api:3000 resolve` com `resolver 127.0.0.11`: as réplicas são redescobertas a cada 5s, com round-robin (verificado: 3 `X-Instance-Id` distintos). `proxy_next_upstream` não reenvia POST. Header `X-Upstream-Addr`.
-- **Reprodutibilidade.** Versões exatas no `package.json`, `bun.lock` com `--frozen-lockfile`, imagens com tag fixa, timezone UTC em todos os containers e em cada conexão PostgreSQL. Testes rodam sem Bun no host (`docker compose --profile tools run --rm toolbox …`).
+- **Multi-stage images** (`infra/docker/Dockerfile`): `deps` (frozen lockfile and local patches) → `dev` (test toolbox) → `build` (`tsc`) → `prod-deps` → `runtime` (`oven/bun:1.4.3-slim`, **non-root** user `bun`, only `dist/` + production dependencies). The `migration-runtime` target adds the migration tooling and is used only by the owner job. The ORM loads the migrator and the migration list dynamically when `withMigrator=true`; APIs and workers do not load those dependencies.
+- **Separate API and workers.** Each process runs a single role (no workers hidden inside the API), which allows scaling and sizing connection pools independently (api 10, consumer 5, outbox 3, reference 3; `max_connections=200`).
+- **Ordered startup.** `postgres` and `localstack` healthy → `migrations` and `queue-bootstrap` jobs (`service_completed_successfully`) → `api`/workers (healthy via `/health/ready`) → `nginx`. `init: true` (correct signal handling), `stop_grace_period: 30s`, `restart: unless-stopped`.
+- **Networks.** `edge` (nginx + api) and `backend` (`internal: true`: database, broker, workers with no external route). Only nginx publishes a port (`8080`, or `API_PUBLIC_PORT`).
+- **nginx.** `server api:3000 resolve` with `resolver 127.0.0.11`: replicas are rediscovered every 5s, with round-robin (verified: 3 distinct `X-Instance-Id`). `proxy_next_upstream` does not resend POST. `X-Upstream-Addr` header.
+- **Reproducibility.** Exact versions in `package.json`, `bun.lock` with `--frozen-lockfile`, images with pinned tags, UTC timezone in every container and on every PostgreSQL connection. Tests run without Bun on the host (`docker compose --profile tools run --rm toolbox …`).
 
-### ADR-015 — Autenticação
+### ADR-015 — Authentication
 
-**Decisão de escopo.** Autenticação não vale pontos e foi deixada como **ponto de extensão explícito**, sem implementação artesanal.
+**Scope decision.** Authentication is not scored and was left as an **explicit extension point**, with no home-grown implementation.
 
-- **Ponto de extensão.** A porta `ProviderIdentityResolver` e o `ProviderAuthGuard` (`src/interfaces/http/auth/provider-identity.ts`) já são aplicados aos controllers. Cada endpoint de escrita e de consulta por provider chama `assertCanActFor(request, providerId)`. O adaptador local `NoopProviderIdentityResolver` aceita todos e **não é segurança**: o processo loga um aviso (`AUTH_MODE=none`) na inicialização.
-- **Desenho de integração com OIDC (Keycloak/Zitadel).**
-  1. Cada provider é um *client* confidencial no IdP (fluxo *client credentials*), com um claim `provider_id` (mapper no Keycloak).
-  2. Um `OidcProviderIdentityResolver` valida o JWT Bearer: assinatura via JWKS (com cache e rotação), `iss`, `aud`, `exp`/`nbf` e algoritmos permitidos. Ele mapeia `provider_id` → `ProviderIdentity.providers`.
-  3. O guard compara o `providerId` do payload com o da identidade (`403 PROVIDER_FORBIDDEN`).
-  4. Health e `/metrics` continuam públicos internamente; o nginx já bloqueia `/metrics` na borda.
-  5. Mensagens SQS são canal interno confiável (conforme o desafio). A identidade do provider na mensagem continua sujeita às validações de domínio (ex.: `PLAYER_WALLET_MISMATCH`, referência do mesmo provider).
-  6. Em Compose, Keycloak entraria num perfil próprio, com realm importado na inicialização.
+- **Extension point.** The `ProviderIdentityResolver` port and the `ProviderAuthGuard` (`src/interfaces/http/auth/provider-identity.ts`) are already applied to the controllers, and `ApiModule.register(core, resolver)` takes the adapter to use. Every write endpoint and every per-provider query endpoint calls `assertCanActFor(request, providerId)` (`403 PROVIDER_FORBIDDEN`). `GET /wagering/transactions/:id` answers `404` for a transaction of a provider the caller cannot act for, so ids cannot be probed. The local adapter `NoopProviderIdentityResolver` accepts everything and **is not security**: the process logs a warning (`AUTH_MODE=none`) at startup. Test: `a caller scoped to another provider gets 403 on its routes and 404 on a foreign transaction id`.
+- **OIDC integration design (Keycloak/Zitadel).**
+  1. Each provider is a confidential *client* in the IdP (*client credentials* flow), with a `provider_id` claim (a mapper in Keycloak).
+  2. An `OidcProviderIdentityResolver` validates the Bearer JWT: signature via JWKS (with caching and rotation), `iss`, `aud`, `exp`/`nbf` and allowed algorithms. It maps `provider_id` → `ProviderIdentity.providers`.
+  3. The guard compares the payload's `providerId` with the identity's (`403 PROVIDER_FORBIDDEN`).
+  4. Health and `/metrics` remain public internally; nginx already blocks `/metrics` at the edge.
+  5. SQS messages are a trusted internal channel (per the challenge). The provider identity in the message is still subject to the domain validations (e.g. `PLAYER_WALLET_MISMATCH`, reference from the same provider).
+  6. In Compose, Keycloak would go into its own profile, with the realm imported at startup.
+
+### ADR-016 — MikroORM as the ORM
+
+**Decision.** MikroORM 6 (the challenge's preferred option; Prisma is forbidden), used as a Unit of Work around hand-written SQL where it matters.
+
+- **Unit of Work and identity map.** One `em.transactional` per use case gives exactly the model the financial path needs: every change tracked in the scope (wallet, transaction, ledger, inbox, outbox) is flushed and committed together or rolled back together, with the isolation level chosen per call (`READ COMMITTED` for writes, `REPEATABLE READ` read-only for reconciliation).
+- **No ORM in the domain.** Records are declared with `EntitySchema` in `infrastructure/persistence/mikroorm/records.ts`, so domain classes carry no decorators. Mappers convert records to aggregates with `rehydrate` and back.
+- **Money mapping.** `NUMERIC(20,2)` columns are declared as `decimal` and exposed as **strings** (the `pg` driver returns `NUMERIC` as text), and the mappers turn them into `Money`. No `number` ever holds an amount (`check:money`).
+- **Hand-written SQL where the ORM would hide the guarantee.** Row locks (`SELECT … FOR UPDATE`), claims with `FOR UPDATE SKIP LOCKED` and leases, and the ledger balance (`Σ` in `NUMERIC`) use parameterized knex queries inside the same transaction (`sql()` helper).
+- **Schema owned by migrations.** Constraints, partial indexes, triggers and grants are written by hand in versioned, reversible migrations (an explicit list in `migrations/index.ts`), never generated from the entities.
+- **Alternatives.** TypeORM (accepted by the challenge) relies on decorators in the entities and has a weaker unit of work, which would push transaction handling into every repository. Drizzle/Kysely are outside the allowed options.
 
 ---
 
-## 6. Diagramas de sequência
+## 6. Sequence diagrams
 
-### 6.1 Processamento de BET (HTTP)
+### 6.1 BET processing (HTTP)
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant P as Provider
     participant N as nginx
-    participant A as api (1 de 3)
+    participant A as api (1 of 3)
     participant DB as PostgreSQL
     participant O as outbox-worker
     participant Q as wager-events.fifo
     P->>N: POST /wagering/transactions (Idempotency-Key)
     N->>A: round-robin
-    A->>A: valida contrato (zod) e Money; calcula payloadHash
+    A->>A: validates contract (zod) and Money; computes payloadHash
     A->>DB: BEGIN
     A->>DB: SELECT wallet FOR UPDATE
-    A->>DB: busca por (provider, key) e (provider, externalId)
+    A->>DB: lookup by (provider, key) and (provider, externalId)
     A->>A: WagerSettlementService.settle → DEBIT, PROCESSED
-    A->>DB: INSERT transação (+snapshot), UPDATE wallet, INSERT ledger, INSERT outbox ×2
-    A->>DB: COMMIT (triggers diferidos verificam ledger ↔ wallet)
+    A->>DB: INSERT transaction (+snapshot), UPDATE wallet, INSERT ledger, INSERT outbox ×2
+    A->>DB: COMMIT (deferred triggers check ledger ↔ wallet)
     A-->>P: 201 {status: PROCESSED, balance, idempotentReplay:false}
-    O->>DB: claim (SKIP LOCKED + lease) e COMMIT
+    O->>DB: claim (SKIP LOCKED + lease) and COMMIT
     O->>Q: SendMessageBatch (dedup = eventId, group = walletId)
-    O->>DB: marca PUBLISHED
+    O->>DB: marks PUBLISHED
 ```
 
-### 6.2 Requisições duplicadas simultâneas
+### 6.2 Concurrent duplicate requests
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant R1 as requisição 1 (api #1)
-    participant R2 as requisição 2 (api #2)
+    participant R1 as request 1 (api #1)
+    participant R2 as request 2 (api #2)
     participant DB as PostgreSQL
     par
-        R1->>DB: BEGIN; SELECT wallet FOR UPDATE (obtém)
+        R1->>DB: BEGIN; SELECT wallet FOR UPDATE (acquires)
     and
-        R2->>DB: BEGIN; SELECT wallet FOR UPDATE (espera)
+        R2->>DB: BEGIN; SELECT wallet FOR UPDATE (waits)
     end
-    R1->>DB: idempotency key ausente → INSERT transação, UPDATE wallet, INSERT ledger, outbox
+    R1->>DB: idempotency key missing → INSERT transaction, UPDATE wallet, INSERT ledger, outbox
     R1->>DB: COMMIT
-    DB-->>R2: lock concedido
-    R2->>DB: SELECT por (provider, key) → encontra o commit de R1
-    R2->>R2: hash igual → REPLAY (sem escrita)
+    DB-->>R2: lock granted
+    R2->>DB: SELECT by (provider, key) → finds R1's commit
+    R2->>R2: same hash → REPLAY (no write)
     R2->>DB: COMMIT
-    Note over R1,R2: 201 para R1, 200 + idempotentReplay para R2, um único débito.<br/>Wallets diferentes com a mesma chave: unique constraint → retry → 409.
+    Note over R1,R2: 201 for R1, 200 + idempotentReplay for R2, a single debit.<br/>Different wallets with the same key: unique constraint → retry → 409.
 ```
 
-### 6.3 REFUND antes da BET
+### 6.3 REFUND before the BET
 
 ```mermaid
 sequenceDiagram
@@ -518,21 +533,21 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant W as reference-worker
     P->>A: REFUND (ref = bet-1)
-    A->>DB: lock wallet; bet-1 não existe
-    A->>DB: INSERT REFUND PENDING_REFERENCE (next_attempt_at = +2s) + evento PendingReference; COMMIT
+    A->>DB: lock wallet; bet-1 does not exist
+    A->>DB: INSERT REFUND PENDING_REFERENCE (next_attempt_at = +2s) + PendingReference event; COMMIT
     A-->>P: 202 Accepted (Location)
     P->>A: BET bet-1
     A->>DB: lock wallet; DEBIT; INSERT BET PROCESSED
-    A->>DB: UPDATE dependentes da wallet: next_attempt_at = agora; COMMIT
+    A->>DB: UPDATE wallet dependents: next_attempt_at = now; COMMIT
     A-->>P: 201
-    W->>DB: claim devidos (SKIP LOCKED + lease); COMMIT
-    W->>DB: lock wallet → lock REFUND; ainda PENDING_REFERENCE?
-    W->>W: mesmas regras: kind, valores, rodada, ainda não revertida
-    W->>DB: CREDIT, REFUND PROCESSED, eventos; COMMIT
-    Note over W,DB: Se bet-1 nunca chegar: backoff 2s, 4s, 8s… até 10 tentativas ou TTL 1h,<br/>então REJECTED REFERENCE_NOT_FOUND + evento.
+    W->>DB: claim due ones (SKIP LOCKED + lease); COMMIT
+    W->>DB: lock wallet → lock REFUND; still PENDING_REFERENCE?
+    W->>W: same rules: kind, amounts, round, not yet reversed
+    W->>DB: CREDIT, REFUND PROCESSED, events; COMMIT
+    Note over W,DB: If bet-1 never arrives: backoff 2s, 4s, 8s… capped at 5 min, until the 1h TTL,<br/>then REJECTED REFERENCE_NOT_FOUND + event.
 ```
 
-### 6.4 Outbox após o commit
+### 6.4 Outbox after the commit
 
 ```mermaid
 sequenceDiagram
@@ -541,20 +556,20 @@ sequenceDiagram
     participant O2 as outbox-worker #2
     participant DB as PostgreSQL
     participant Q as wager-events.fifo
-    O1->>DB: claim lote A (FOR UPDATE SKIP LOCKED, lease 30s, attempts+1); COMMIT
-    O2->>DB: claim lote B (linhas de A puladas); COMMIT
-    O1->>Q: publica A (nenhum lock aberto)
-    O1--xO1: processo morre antes de confirmar
-    O2->>Q: publica B
+    O1->>DB: claim batch A (FOR UPDATE SKIP LOCKED, lease 30s, attempts+1); COMMIT
+    O2->>DB: claim batch B (rows of A skipped); COMMIT
+    O1->>Q: publishes A (no open lock)
+    O1--xO1: process dies before confirming
+    O2->>Q: publishes B
     O2->>DB: B → PUBLISHED
-    Note over DB: lease de A expira
+    Note over DB: lease on A expires
     O2->>DB: claim A (attempts = 2); COMMIT
-    O2->>Q: republica A com os mesmos eventIds
+    O2->>Q: republishes A with the same eventIds
     O2->>DB: A → PUBLISHED
-    Note over Q: Cópia descartada pela dedup FIFO (5 min) ou deduplicada<br/>pelo consumidor via eventId: at-least-once, sem perda.
+    Note over Q: Copy discarded by FIFO dedup (5 min) or deduplicated<br/>by the consumer via eventId: at-least-once, no loss.
 ```
 
-### 6.5 Falha entre commit e ack (SQS)
+### 6.5 Failure between commit and ack (SQS)
 
 ```mermaid
 sequenceDiagram
@@ -564,91 +579,94 @@ sequenceDiagram
     participant C2 as consumer #2
     participant DB as PostgreSQL
     Q->>C1: ReceiveMessage (visibility 30s)
-    C1->>DB: BEGIN; lock wallet; inbox (consumer, messageId) ausente
-    C1->>DB: efeito financeiro + INSERT inbox PROCESSED; COMMIT
-    C1--xC1: SIGKILL antes do DeleteMessage
-    Note over Q: visibility timeout expira
-    Q->>C2: reentrega (ApproximateReceiveCount = 2)
-    C2->>DB: BEGIN; lock wallet; inbox já PROCESSED, mesmo hash
-    C2->>DB: COMMIT (nenhuma escrita)
+    C1->>DB: BEGIN; lock wallet; inbox (consumer, messageId) missing
+    C1->>DB: financial effect + INSERT inbox PROCESSED; COMMIT
+    C1--xC1: SIGKILL before DeleteMessage
+    Note over Q: visibility timeout expires
+    Q->>C2: redelivery (ApproximateReceiveCount = 2)
+    C2->>DB: BEGIN; lock wallet; inbox already PROCESSED, same hash
+    C2->>DB: COMMIT (no writes)
     C2->>Q: DeleteMessage (ack)
-    Note over C2: wagering_inbox_duplicates_total += 1, um único efeito.
+    Note over C2: wagering_inbox_duplicates_total += 1, a single effect.
 ```
 
 ---
 
-## 7. Matriz de falhas
+## 7. Failure matrix
 
-| Ponto de interrupção / falha | Estado no banco | Estado no broker | Recuperação | Teste |
+| Interruption / failure point | Database state | Broker state | Recovery | Test |
 |---|---|---|---|---|
-| Processo da API morre **antes do COMMIT** | nada (PostgreSQL faz ROLLBACK ao perder a conexão) | — | cliente repete com a mesma chave → aplicado uma vez | `API killed after writing and BEFORE COMMIT` (SIGKILL real) |
-| API morre **após o COMMIT, antes da resposta** | operação confirmada | — | cliente repete → `200` replay com o resultado original | `identical replay returns the ORIGINAL result` |
-| Erro em qualquer etapa antes do COMMIT | nada | nada | exceção; idempotência permite repetir | `a failure after every write but before COMMIT leaves no partial state` |
-| PostgreSQL indisponível | — | mensagens ficam na fila: o consumidor pausa e só retoma quando o banco responde | HTTP: `503 DATABASE_UNAVAILABLE` (retryable), readiness 503, liveness 200; recupera sozinho | `PostgreSQL unavailable: 503 …`, `a database outage longer than the retry budget pauses consumption …` |
-| Lock da wallet preso além de `lock_timeout` | nada | — | retry interno; depois `503 LOCK_TIMEOUT` (retryable) | `lock_timeout: bounded wait …` |
-| Deadlock | transação vítima revertida | — | reexecução automática da unidade inteira | `a provoked deadlock is detected …` |
-| Consumer morre **antes do COMMIT** | nada | mensagem invisível até o timeout | reentrega → processada uma vez | `restart under load` (SIGKILL no meio do fluxo) |
-| Consumer morre **após o COMMIT, antes do ack** | efeito + inbox confirmados | mensagem volta após o timeout | inbox → `DUPLICATE_MESSAGE` → ack | `consumer killed AFTER the commit and BEFORE the ack` |
-| `DeleteMessage` falha | confirmado | mensagem volta | igual ao anterior; métrica de falha | — (mesmo caminho do anterior) |
-| Erro transitório persistente | `inbox_attempts`; inbox `DEAD_LETTERED` | retries com backoff; após 5 tentativas reais → DLQ pelo consumidor | operador corrige a causa e faz redrive; inbox garante efeito único | `transient failures are retried …`, `… dead-lettered after maxAttempts real attempts`, `… keep their own budget` |
-| Mensagem inválida / contrato violado | inbox `DEAD_LETTERED` (se houver `messageId`) | DLQ imediata, com motivo | correção na origem | `invalid messages go straight to the DLQ …` |
-| SIGTERM no consumer | em andamento concluídas | não iniciadas devolvidas (visibility 0) | outra instância processa | `graceful stop: in-flight work completes`, `restart under load` (SIGTERM) |
-| Outbox: morre **após o claim, antes de publicar** | `PENDING` com lease | nada publicado | lease expira → outro publisher assume | mesmo mecanismo de lease exercitado em `crash after SQS publish and before the DB confirmation: lease expires …` |
-| Outbox: morre **após publicar, antes de confirmar** | `PENDING` com lease, `attempts=1` | evento publicado | lease expira → republica com o mesmo `eventId` (`attempts=2`) | `outbox publisher killed AFTER publishing and BEFORE confirming` (SIGKILL real) |
-| SQS de eventos indisponível | `PENDING`, backoff persistido | — | retries até 15; depois `DEAD` (retido, alerta) e reenfileiramento manual | `broker failure: backoff persisted …` |
-| Reference worker morre no meio | transação revertida; lease ativo | — | lease expira → outra tentativa | `an expired lease makes the transaction claimable …` |
-| Referência nunca chega | `PENDING_REFERENCE` até esgotar | evento `PendingReference` | `REJECTED REFERENCE_NOT_FOUND` + evento | `backoff, then REJECTED with REFERENCE_NOT_FOUND …` |
-| Reinício de todos os serviços | tudo que foi confirmado | mensagens não confirmadas reaparecem | inbox + idempotência | `restart under load …` (consistência final verificada) |
-| Restart do LocalStack | — | **filas e mensagens perdidas** (sem persistência na edição community) | rerodar `queue-bootstrap`; ver Limitações | — |
+| API process dies **before COMMIT** | nothing (PostgreSQL rolls back when the connection is lost) | — | client retries with the same key → applied once | `API killed after writing and BEFORE COMMIT` (real SIGKILL) |
+| API dies **after COMMIT, before the response** | operation committed | — | client retries → `200` replay with the original result | `identical replay returns the ORIGINAL result` |
+| Error at any step before COMMIT | nothing | nothing | exception; idempotency allows retrying | `a failure after every write but before COMMIT leaves no partial state` |
+| PostgreSQL unavailable | — | messages stay in the queue: the consumer pauses and only resumes when the database responds | HTTP: `503 DATABASE_UNAVAILABLE` (retryable), readiness 503, liveness 200; recovers on its own | `PostgreSQL unavailable: 503 …`, `a database outage longer than the retry budget pauses consumption …` |
+| Wallet lock held beyond `lock_timeout` | nothing | — | internal retry; then `503 LOCK_TIMEOUT` (retryable) | `lock_timeout: bounded wait …` |
+| Deadlock | victim transaction rolled back | — | automatic re-run of the entire unit | `a provoked deadlock is detected …` |
+| Consumer dies **before COMMIT** | nothing | message invisible until the timeout | redelivery → processed once | `restart under load` (SIGKILL mid-flow) |
+| Consumer dies **after COMMIT, before the ack** | effect + inbox committed | message comes back after the timeout | inbox → `DUPLICATE_MESSAGE` → ack | `consumer killed AFTER the commit and BEFORE the ack` |
+| `DeleteMessage` fails | committed | message comes back | same as the previous row; failure metric | — (same path as the previous row) |
+| Persistent transient error | `inbox_attempts`; inbox `DEAD_LETTERED` | retries with backoff; after 5 real attempts → DLQ by the consumer | operator fixes the cause and redrives; inbox guarantees a single effect | `transient failures are retried …`, `… dead-lettered after maxAttempts real attempts`, `… keep their own budget` |
+| Invalid message / violated contract | inbox `DEAD_LETTERED` (if there is a `messageId`) | immediate DLQ, with reason | fix at the source | `invalid messages go straight to the DLQ …` |
+| SIGTERM on the consumer | in-flight work completed | unstarted ones returned (visibility 0) | another instance processes them | `graceful stop: in-flight work completes`, `restart under load` (SIGTERM) |
+| Outbox: dies **after the claim, before publishing** | `PENDING` with lease | nothing published | lease expires → another publisher takes over | same lease mechanism exercised in `crash after SQS publish and before the DB confirmation: lease expires …` |
+| Outbox: dies **after publishing, before confirming** | `PENDING` with lease, `attempts=1` | event published | lease expires → republishes with the same `eventId` (`attempts=2`) | `outbox publisher killed AFTER publishing and BEFORE confirming` (real SIGKILL) |
+| Events SQS unavailable | `PENDING`, persisted backoff | — | retries up to 15; then `DEAD` (retained, alert) and manual re-enqueue | `broker failure: backoff persisted …` |
+| Reference worker dies midway | transaction rolled back; lease active | — | lease expires → another attempt | `an expired lease makes the transaction claimable …` |
+| Reference never arrives | `PENDING_REFERENCE` until exhausted | `PendingReference` event | `REJECTED REFERENCE_NOT_FOUND` + event | `backoff, then REJECTED with REFERENCE_NOT_FOUND …` |
+| Restart of all services | everything that was committed | unacknowledged messages reappear | inbox + idempotency | `restart under load …` (final consistency verified) |
+| LocalStack restart | — | **queues and messages lost** (no persistence in the community edition) | rerun `queue-bootstrap`; see Limitations | — |
 
 ---
 
-## 8. Interpretações e hipóteses adotadas
+## 8. Interpretations and assumptions
 
-1. **REFUND × ROLLBACK sobre a mesma BET (interpretação conservadora).** O README proíbe reverter duas vezes "pelo mesmo tipo". Esta solução vai além e permite **no máximo uma reversão bem-sucedida por transação referenciada, qualquer que seja o tipo**. REFUND seguido de ROLLBACK da mesma BET (ou o inverso) creditaria duas vezes o mesmo valor econômico. A segunda reversão é `REJECTED REFERENCE_ALREADY_REVERSED`, imposta no domínio e pelo índice único parcial. Um **ROLLBACK de um REFUND** é permitido como operação compensatória separada: a referência é o REFUND, não a BET. Consequência: após ROLLBACK-do-REFUND, a BET original não pode ser reembolsada de novo (seria preciso um procedimento operacional).
-2. **WIN e LOSS** podem referenciar uma BET da mesma rodada (opcional). Se a referência ainda não chegou, aguardam como as reversões. Uma BET pode ter vários WINs (ex.: rodadas bônus). Um WIN que referencia uma BET **já revertida** (REFUND/ROLLBACK) é aceito: o desafio não proíbe esse caso, e o pagamento de um prêmio é um fato independente da devolução da aposta. Se o negócio exigir o contrário, a regra é uma linha a mais no `validateReference`.
-3. **LOSS** aceita `0.00` (ou qualquer valor ≥ 0): registra o resultado, nunca move dinheiro, não gera ledger nem muda versão, e emite `WagerTransactionProcessed`. **WIN de 0.00** é rejeitado como payload inválido (400); use LOSS.
-4. **Wallet inexistente** em `POST /wagering/transactions` → `404 WALLET_NOT_FOUND`, sem persistência (a FK exige a wallet). Via SQS o resultado vai para o inbox e a mensagem recebe ack.
-5. **Jogador ou moeda incompatíveis com a wallet** são rejeições de negócio **persistidas** (auditáveis), não erros de validação.
-6. **Idempotência por provider**: as chaves são únicas por `providerId`.
-7. **Códigos HTTP do replay**: PROCESSED → `201` na primeira vez e `200` no replay; REJECTED → `422` sempre; PENDING → `202` enquanto pendente.
-8. **Versão da wallet** começa em 1 já com o saldo de abertura (o OPENING é a versão 1); com saldo inicial zero não há lançamento, e o primeiro movimento é a versão 2.
-9. **OPENING** usa provider `internal`, `externalTransactionId = wallet-opening:<walletId>` e canal `INTERNAL` (`OPENING` só existe nesse canal, e vice-versa).
-10. **Tempo**: a aplicação usa um `Clock` (injetável nos testes), não `now()` do banco. Pressupõe relógios sincronizados (NTP) entre instâncias, como num cluster comum.
-11. **Moedas**: domínio multi-moeda (ISO-4217 com 2 casas); a API cria wallets só nas moedas de `ACCEPTED_CURRENCIES` (padrão `BRL`). Transações em outra moeda válida contra uma wallet BRL são `CURRENCY_MISMATCH` (persistidas).
-12. **Identificadores** (`providerId`, `externalTransactionId`, `roundId`, `gameId`, `playerId`) aceitam letras, dígitos e `._:-` (até 64/128 caracteres). `walletId` é UUID, aceito em maiúsculas ou minúsculas e normalizado para minúsculas no contrato (HTTP e SQS) antes do hash: as duas grafias são a mesma wallet e a mesma operação. `Idempotency-Key`: 1 a 255 caracteres ASCII imprimíveis.
-13. **Correlation id no SQS**: usa o `correlationId` do envelope; senão o atributo da mensagem; senão o `messageId`. Só vale um candidato que caiba no schema (≤ 128 caracteres seguros); se nenhum couber, um UUID é gerado. Um `messageId` longo (o contrato permite 256) nunca impede o registro da operação.
-14. **Inbox de mensagem nunca processada** (`DEAD_LETTERED`): ao ser reenviada (redrive ou correção na origem), a mensagem é processada normalmente, e o payload efetivamente processado passa a ser o que as reentregas seguintes precisam igualar.
-
----
-
-## 9. Limitações conhecidas
-
-- **LocalStack community sem persistência**: reiniciar o container perde filas e mensagens não consumidas (o job `queue-bootstrap` recria as filas no próximo `up`). Em produção, o SQS real é durável.
-- **Ordenação de eventos** por wallet não é garantida entre lotes de publishers concorrentes (ADR-009); os consumidores devem usar `walletVersion`/`eventId`.
-- **Janela de deduplicação** do SQS FIFO é de 5 minutos; depois dela, duplicatas de eventos chegam aos consumidores (que devem deduplicar por `eventId`).
-- **Hot wallets** têm throughput limitado pela serialização e ocupam conexões enquanto esperam (medido em `docs/LOAD_TEST.md`).
-- **Sem retenção/arquivamento** de `inbox_messages`, `inbox_attempts` e `outbox_messages` publicados (crescem indefinidamente; seria um job agendado).
-- **Reconciliação sob demanda**, por wallet; não há varredura agendada.
-- **Autenticação**: apenas o ponto de extensão (ADR-015).
-- **Sem OpenTelemetry/Jaeger** (ADR-013).
-- **Ledger de entrada única**; sem partidas dobradas.
-- **Reversões parciais** e **novo reembolso após ROLLBACK de REFUND** não são suportados (§8).
-- **Triggers podem ser desativados por superusuário** (`session_replication_role`); a reconciliação detecta o efeito, mas não o impede.
-- **Desenvolvimento no host** (`bun run dev` fora do Docker) exige Bun instalado e as portas do Postgres/LocalStack expostas (`docker-compose.dev.yml`). Neste ambiente de validação o Bun não estava instalado no host, então esse modo não foi exercitado aqui; todos os comandos foram validados dentro de containers.
+1. **REFUND vs. ROLLBACK on the same BET (conservative interpretation).** The README forbids reversing twice "with the same kind". This solution goes further and allows **at most one successful reversal per referenced transaction, whatever the kind**. A REFUND followed by a ROLLBACK of the same BET (or the reverse) would credit the same economic value twice. The second reversal is `REJECTED REFERENCE_ALREADY_REVERSED`, enforced in the domain and by the partial unique index. A **ROLLBACK of a REFUND** is allowed as a separate compensating operation: the reference is the REFUND, not the BET. Consequence: after a ROLLBACK-of-REFUND, the original BET cannot be refunded again (that would require an operational procedure).
+2. **WIN and LOSS** may reference a BET from the same round (optional). If the reference has not arrived yet, they wait like reversals do. A BET may have several WINs (e.g. bonus rounds). A WIN referencing a BET that has **already been reversed** (REFUND/ROLLBACK) is accepted: the challenge does not forbid this case, and paying out a prize is a fact independent of returning the bet. If the business requires otherwise, the rule is one more line in `validateReference`.
+3. **LOSS** accepts `0.00` (or any amount ≥ 0): it records the outcome, never moves money, produces no ledger entry and no version change, and emits `WagerTransactionProcessed`. A **WIN of 0.00** is rejected as an invalid payload (400); use LOSS.
+4. **Nonexistent wallet** in `POST /wagering/transactions` → `404 WALLET_NOT_FOUND`, with no persistence (the FK requires the wallet). Via SQS the result goes to the inbox and the message is acked.
+5. **Player or currency incompatible with the wallet** are **persisted** business rejections (auditable), not validation errors.
+6. **Idempotency per provider**: keys are unique per `providerId`.
+7. **Replay HTTP codes**: PROCESSED → `201` the first time and `200` on replay; REJECTED → always `422`; PENDING → `202` while pending; FAILED (reference resolution failed after repeated unexpected errors) → `500 REFERENCE_RESOLUTION_FAILED`, terminal and auditable.
+8. **Wallet version** starts at 1 already holding the opening balance (OPENING is version 1); with a zero initial balance there is no entry, and the first movement is version 2.
+9. **OPENING** uses provider `internal`, `externalTransactionId = wallet-opening:<walletId>` and channel `INTERNAL` (`OPENING` only exists on that channel, and vice versa). The provider id `internal` is **reserved**: providers cannot submit under it (contract `400` on HTTP, DLQ `INVALID_MESSAGE` on SQS, domain rule, and the `wager_tx_internal_provider_ck` constraint). Otherwise a request with `providerId: "internal"` would look up the idempotency keys of the system's own transactions.
+10. **Time**: the application uses a `Clock` (injectable in tests), not the database's `now()`. It assumes clocks synchronized (NTP) across instances, as in any ordinary cluster.
+11. **Currencies**: multi-currency domain (ISO-4217 with 2 decimal places); the API only creates wallets in the currencies listed in `ACCEPTED_CURRENCIES` (default `BRL`). Transactions in another valid currency against a BRL wallet are `CURRENCY_MISMATCH` (persisted).
+12. **Identifiers** (`providerId`, `externalTransactionId`, `roundId`, `gameId`, `playerId`) accept letters, digits and `._:-` (up to 64/128 characters). `walletId` is a UUID, accepted in upper or lower case and normalized to lower case in the contract (HTTP and SQS) before hashing: both spellings are the same wallet and the same operation. `Idempotency-Key`: 1 to 255 printable ASCII characters.
+13. **Correlation id on SQS**: uses the envelope's `correlationId`; otherwise the message attribute; otherwise the `messageId`. Only a candidate that fits the schema (≤ 128 safe characters) is used; if none fits, a UUID is generated. A long `messageId` (the contract allows 256) never prevents the operation from being recorded.
+14. **Inbox row for a never-processed message** (`DEAD_LETTERED`): when resent (redrive or fix at the source), the message is processed normally, and the payload actually processed becomes the one that subsequent redeliveries must match.
+15. **`REFERENCE_NOT_FOUND` also covers a reference that exists but never settles** within the TTL (for example a ROLLBACK waiting on a REFUND that is itself waiting for its BET). For the provider the action is the same: the referenced operation did not become usable in time.
 
 ---
 
-## 10. Escolha de versões
+## 9. Known limitations
 
-| Componente | Versão | Motivo |
+- **LocalStack community has no persistence**: restarting the container loses queues and unconsumed messages (the `queue-bootstrap` job recreates the queues on the next `up`). In production, real SQS is durable.
+- **Event ordering** per wallet is not guaranteed across batches from concurrent publishers (ADR-009); consumers must use `walletVersion`/`eventId`.
+- **The deduplication window** of SQS FIFO is 5 minutes; after it, event duplicates reach the consumers (who must deduplicate by `eventId`).
+- **Hot wallets** have throughput limited by serialization and hold connections while waiting (measured in `docs/LOAD_TEST.md`).
+- **No retention/archiving** of `inbox_messages`, `inbox_attempts` and published `outbox_messages` (they grow indefinitely; this would be a scheduled job).
+- **On-demand reconciliation**, per wallet; there is no scheduled sweep.
+- **Authentication**: only the extension point (ADR-015).
+- **No OpenTelemetry/Jaeger** (ADR-013).
+- **Single-entry ledger**; no double-entry bookkeeping.
+- **Partial reversals** and **a new refund after a ROLLBACK of a REFUND** are not supported (§8).
+- **Triggers can be disabled by a superuser** (`session_replication_role`); reconciliation detects the effect but does not prevent it.
+- **Correlation of deferred settlements.** When the reference worker settles a `PENDING_REFERENCE` transaction, its log lines and events use `correlationId = reference-resolution:<transactionId>` instead of the original request's id (the transaction row does not store it). The `transactionId` still ties the two together.
+- **A pending-reference row that crashes the worker** is retried after each lease expiry with no attempt counted (the attempt is only recorded with an outcome). Nothing is applied twice (each attempt is one rolled-back transaction), but the row is not retired automatically; the TTL does not help because it is only evaluated by a successful attempt.
+- **Development on the host** (`bun run dev` outside Docker) requires Bun installed and the Postgres/LocalStack ports exposed (`docker-compose.dev.yml`). In this validation environment Bun was not installed on the host, so this mode was not exercised here; all commands were validated inside containers.
+
+---
+
+## 10. Version choices
+
+| Component | Version | Reason |
 |---|---|---|
-| Bun | 1.4.3 | 1.x estável (12 dias de publicação no momento da escolha, contra 1.4.4 lançado no mesmo dia) |
-| TypeScript | 6.0.3 | última versão suportada pelo `typescript-eslint` 8.x (TS 7 nativo ainda não é suportado) |
-| NestJS | 11.2.7 | linha madura (desde jan/2025) e ainda com patches; a 12.x tinha 8 semanas e migrou para ESM-only |
-| MikroORM | 6.6.17 | linha madura e com patches (out/2026); a 7.x removeu o knex e mudou APIs |
-| PostgreSQL | 17 (alpine) | estável; nenhum recurso do 18 é necessário |
-| LocalStack | 4.14.0 | **última imagem community que roda sem `LOCALSTACK_AUTH_TOKEN`**; as tags `2026.x` encerram com "License activation failed" (verificado). Configurável via `LOCALSTACK_IMAGE`/`LOCALSTACK_AUTH_TOKEN` |
-| nginx | 1.28 | suporta `server … resolve` no open source (redescoberta de réplicas) |
-| zod 4.6, decimal.js 10.6, pino 10.4, @prometheus-io/client 0.16, AWS SDK v3 3.1150 | — | versões estáveis fixadas exatamente; `bun.lock` com `--frozen-lockfile` |
-| `ajv` 8.13 (devDependency) | — | corrige o hoisting: o ESLint traz `ajv@6` para a raiz e o `ajv-draft-04` (do `umzug`, usado pelo Migrator) precisa do 8. Afeta só o ambiente de desenvolvimento: a imagem de produção não inclui o ESLint |
+| Bun | 1.4.3 | stable 1.x (12 days since release at the time of the choice, versus 1.4.4 released that same day) |
+| TypeScript | 6.0.3 | latest version supported by `typescript-eslint` 8.x (native TS 7 is not supported yet) |
+| NestJS | 11.2.7 | mature line (since Jan 2025) and still receiving patches; 12.x was 8 weeks old and moved to ESM-only |
+| MikroORM | 6.6.17 | mature line with patches (Oct 2026); 7.x removed knex and changed APIs |
+| PostgreSQL | 17 (alpine) | stable; no 18 feature is needed |
+| LocalStack | 4.14.0 | **latest community image that runs without `LOCALSTACK_AUTH_TOKEN`**; the `2026.x` tags exit with "License activation failed" (verified). Configurable via `LOCALSTACK_IMAGE`/`LOCALSTACK_AUTH_TOKEN` |
+| nginx | 1.28 | supports `server … resolve` in open source (replica rediscovery) |
+| zod 4.6, decimal.js 10.6, pino 10.4, @prometheus-io/client 0.16, AWS SDK v3 3.1150 | — | stable versions pinned exactly; `bun.lock` with `--frozen-lockfile` |
+| `ajv` 8.13 (devDependency) | — | fixes hoisting: ESLint pulls `ajv@6` into the root and `ajv-draft-04` (from `umzug`, used by the Migrator) needs 8. Only affects the development environment: the production image does not include ESLint |

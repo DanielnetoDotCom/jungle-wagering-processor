@@ -130,9 +130,7 @@ export class ProcessWagerTransactionUseCase {
 
     const byKey = await scope.transactions.findByIdempotencyKey(payload.providerId, command.idempotencyKey);
     if (byKey) {
-      return byKey.matchesPayload(payloadHash)
-        ? { type: 'REPLAY', transaction: toTransactionView(byKey) }
-        : { type: 'CONFLICT', code: 'IDEMPOTENCY_KEY_CONFLICT', existingTransactionId: byKey.id };
+      return idempotentOutcome(byKey, payloadHash);
     }
     // Same provider operation submitted under another idempotency key: never a second effect.
     const byExternalId = await scope.transactions.findByExternalId(
@@ -219,6 +217,18 @@ export class ProcessWagerTransactionUseCase {
     }
     this.metrics.processingDuration('process-wager', result.type, seconds);
   }
+}
+
+/**
+ * A transaction already stored under the same idempotency key: the identical
+ * payload gets the ORIGINAL result back (including the balance observed then),
+ * any other payload is a conflict. Never a second effect, never a replay of a
+ * different operation.
+ */
+export function idempotentOutcome(existing: WagerTransaction, payloadHash: string): WagerSubmissionResult {
+  return existing.matchesPayload(payloadHash)
+    ? { type: 'REPLAY', transaction: toTransactionView(existing) }
+    : { type: 'CONFLICT', code: 'IDEMPOTENCY_KEY_CONFLICT', existingTransactionId: existing.id };
 }
 
 function inboxResultOf(result: WagerSubmissionResult): {

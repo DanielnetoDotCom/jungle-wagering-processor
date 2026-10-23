@@ -3,6 +3,7 @@ import type {
   InboxRepository,
   OutboxBacklog,
   OutboxRepository,
+  RetiredOutboxEvent,
 } from '../../../application/ports/persistence.ports';
 import type { InboxMessage } from '../../../domain/messaging/inbox-message';
 import type { OutboxMessage } from '../../../domain/messaging/outbox-message';
@@ -116,6 +117,21 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
       .map(toOutboxMessage);
   }
 
+  async retireAbandoned(params: { now: Date; maxAttempts: number }): Promise<RetiredOutboxEvent[]> {
+    const retired = await sql<RetiredRow>(
+      this.em,
+      `UPDATE outbox_messages
+          SET status = 'DEAD', claimed_by = NULL, claim_expires_at = NULL,
+              last_error = 'abandoned: no outcome recorded after the last attempt'
+        WHERE status = 'PENDING'
+          AND attempts >= ?
+          AND claim_expires_at < ?
+       RETURNING id, event_type, aggregate_id, correlation_id, attempts`,
+      [params.maxAttempts, params.now],
+    );
+    return retiredEvents(retired.rows);
+  }
+
   async markPublished(ids: readonly string[], at: Date): Promise<number> {
     if (ids.length === 0) return 0;
     const result = await sql(
@@ -166,4 +182,22 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
       oldestPendingSeconds: Math.max(0, row?.oldest_pending_seconds ?? 0),
     };
   }
+}
+
+interface RetiredRow {
+  id: string;
+  event_type: string;
+  aggregate_id: string;
+  correlation_id: string;
+  attempts: number;
+}
+
+function retiredEvents(rows: RetiredRow[]): RetiredOutboxEvent[] {
+  return rows.map((row) => ({
+    id: row.id,
+    eventType: row.event_type,
+    aggregateId: row.aggregate_id,
+    correlationId: row.correlation_id,
+    attempts: row.attempts,
+  }));
 }

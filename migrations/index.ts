@@ -5,6 +5,7 @@ import { Migration20261022000300IntegrityTriggers } from './Migration20261022000
 import { Migration20261022000400ApplicationRole } from './Migration20261022000400ApplicationRole';
 import { Migration20261022000500FinancialIntegrity } from './Migration20261022000500FinancialIntegrity';
 import { Migration20261023000100InboxAttempts } from './Migration20261023000100InboxAttempts';
+import { Migration20261023000200ReservedInternalProvider } from './Migration20261023000200ReservedInternalProvider';
 
 /**
  * Explicit, ordered migration list (no filesystem discovery): identical in
@@ -17,4 +18,8 @@ export const MIGRATIONS: MigrationObject[] = [
   { name: 'Migration20261022000400ApplicationRole', class: Migration20261022000400ApplicationRole },
   { name: 'Migration20261022000500FinancialIntegrity', class: Migration20261022000500FinancialIntegrity },
   { name: 'Migration20261023000100InboxAttempts', class: Migration20261023000100InboxAttempts },
+  {
+    name: 'Migration20261023000200ReservedInternalProvider',
+    class: Migration20261023000200ReservedInternalProvider,
+  },
 ];

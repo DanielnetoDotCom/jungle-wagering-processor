@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { ResourceNotFoundError } from '../../src/application/errors/application-errors';
 import type { Core } from '../../src/bootstrap/core';
 import { WagerTransactionKind as Kind } from '../../src/domain/wagering/wager-transaction-types';
+import { expectAllWalletsConsistent } from '../support/consistency';
 import { createTestCore } from '../support/core';
 import { TestDatabase } from '../support/database';
 import { httpCommand, payload, uniqueId } from '../support/fixtures';
@@ -9,6 +10,8 @@ import { httpCommand, payload, uniqueId } from '../support/fixtures';
 describe('Reconciliation: materialized balance vs immutable ledger', () => {
   let db: TestDatabase;
   let core: Core;
+  /** Wallets corrupted on purpose; every other wallet must stay consistent. */
+  const tampered = new Set<string>();
 
   beforeAll(async () => {
     db = await TestDatabase.create('reconciliation');
@@ -16,6 +19,8 @@ describe('Reconciliation: materialized balance vs immutable ledger', () => {
   });
 
   afterAll(async () => {
+    expect(tampered.size).toBeGreaterThan(0);
+    expect(await expectAllWalletsConsistent(db, { except: tampered })).toBeGreaterThan(0);
     await core.close();
     await db.drop();
   });
@@ -43,7 +48,8 @@ describe('Reconciliation: materialized balance vs immutable ledger', () => {
   }
 
   /** Simulates corruption that bypasses every trigger (only possible for a superuser). */
-  async function tamper(sql: string, params: unknown[]): Promise<void> {
+  async function tamper(sql: string, params: [walletId: string, ...rest: unknown[]]): Promise<void> {
+    tampered.add(params[0]);
     const client = await db.admin.connect();
     try {
       await client.query('BEGIN');

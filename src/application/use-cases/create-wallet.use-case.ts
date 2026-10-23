@@ -2,7 +2,11 @@ import { WalletBalanceChanged, WagerTransactionProcessed } from '../../domain/ev
 import { OutboxMessage } from '../../domain/messaging/outbox-message';
 import { Money } from '../../domain/money/money';
 import { WagerTransaction } from '../../domain/wagering/wager-transaction';
-import { TransactionChannel, WagerTransactionKind } from '../../domain/wagering/wager-transaction-types';
+import {
+  INTERNAL_PROVIDER_ID,
+  TransactionChannel,
+  WagerTransactionKind,
+} from '../../domain/wagering/wager-transaction-types';
 import { Wallet } from '../../domain/wallet/wallet';
 import { canonicalJson } from '../../shared/canonical-json';
 import type { CreateWalletCommand } from '../commands/wager-commands';
@@ -16,9 +20,6 @@ import type { UnitOfWork } from '../ports/persistence.ports';
 import type { Clock, IdGenerator, Logger } from '../ports/runtime.ports';
 import { sha256Hex } from '../services/payload-hash';
 import { toWalletView, type WalletView } from '../views';
-
-/** Provider id used for internal (system-generated) transactions such as OPENING. */
-export const INTERNAL_PROVIDER_ID = 'internal';
 
 /**
  * Opens a wallet. A positive initial balance is a financial movement, so it

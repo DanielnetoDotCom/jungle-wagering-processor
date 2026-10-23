@@ -1,57 +1,57 @@
 # CI/CD
 
-Os workflows ficam em [`.github/workflows/`](../.github/workflows/). As Actions de terceiros são fixadas por SHA; o Dependabot propõe atualizações desses pins. Todos os jobs usam permissões mínimas, instalação com `bun.lock` congelado e limites de tempo.
+The workflows live in [`.github/workflows/`](../.github/workflows/). Third-party Actions are pinned by SHA; Dependabot proposes updates to those pins. Every job uses minimal permissions, installs with a frozen `bun.lock`, and has time limits.
 
-## Checks de cada push e pull request
+## Checks on every push and pull request
 
-O workflow **CI** roda em pushes para `main`, tags `v*`, pull requests e acionamento manual:
+The **CI** workflow runs on pushes to `main`, `v*` tags, pull requests, and manual dispatch:
 
-| Job | Evidência |
+| Job | Evidence |
 |---|---|
-| Quality and unit tests | ESLint com fronteiras de camadas, Prettier, TypeScript estrito, `check:money`, build e testes unitários. Publica JUnit e cobertura LCOV dos arquivos exercitados pelos unitários. |
-| PostgreSQL and SQS — integration | Migrations reversíveis, grants runtime, ataques SQL ao schema, atomicidade, HTTP, inbox, outbox, retry/DLQ, referências pendentes e encerramento além do prazo. |
-| PostgreSQL and SQS — concurrency | Operações simultâneas, três instâncias, idempotência, wallets independentes, contenção, deadlocks e saldo não negativo. |
-| PostgreSQL and SQS — fault-injection | Processos mortos com SIGKILL antes/depois de commit, antes de ACK e após publicação no broker; recuperação e reconciliação. |
-| PostgreSQL and SQS — e2e | Entry points compilados em processos independentes, com banco e filas próprios. |
-| Docker Compose smoke | Build das imagens reais e inicialização do stack inteiro; nginx atende pelo menos três APIs; duas BETs de 80,00 sobre saldo 100,00 produzem 201/422; replay conserva saldo histórico após WIN; conflito de payload, ledger e reconciliação são conferidos. |
+| Quality and unit tests | ESLint with layer boundaries, Prettier, strict TypeScript, `check:money`, build and unit tests. Publishes JUnit and LCOV coverage for the files exercised by the unit tests. |
+| PostgreSQL and SQS — integration | Reversible migrations, runtime grants, SQL attacks on the schema, atomicity, HTTP, inbox, outbox, retry/DLQ, pending references, and shutdown past the deadline. |
+| PostgreSQL and SQS — concurrency | Simultaneous operations, three instances, idempotency, independent wallets, contention, deadlocks, and non-negative balance. |
+| PostgreSQL and SQS — fault-injection | Processes killed with SIGKILL before/after commit, before ACK, and after publishing to the broker; recovery and reconciliation. |
+| PostgreSQL and SQS — e2e | Compiled entry points in independent processes, with their own database and queues. |
+| Docker Compose smoke | Builds the real images and starts the whole stack; nginx serves at least three APIs; two BETs of 80.00 against a balance of 100.00 produce 201/422; a replay keeps the historical balance after a WIN; payload conflict, ledger and reconciliation are checked. |
 
-Cada job de testes recebe seus próprios containers PostgreSQL 17 e LocalStack 4.14. Os testes também criam bancos e filas exclusivos por suíte. O smoke usa um projeto Compose exclusivo por execução e remove somente seus próprios recursos no encerramento. Testes com falha não são convertidos em sucesso. JUnit, cobertura, relatório do smoke e logs de diagnóstico ficam nos artefatos do run por 14 dias.
+Each test job gets its own PostgreSQL 17 and LocalStack 4.14 containers. The tests also create dedicated databases and queues per suite. The smoke test uses a dedicated Compose project per run and removes only its own resources at teardown. Failing tests are not turned into successes. JUnit, coverage, the smoke report and diagnostic logs are kept as run artifacts for 14 days.
 
-Cobertura unitária não é cobertura de todo o sistema: integrações e falhas são verificadas nas suítes reais, sem inventar uma porcentagem global. O teste de carga de longa duração permanece acionado separadamente; o relatório histórico está em [LOAD_TEST.md](LOAD_TEST.md).
+Unit coverage is not whole-system coverage: integrations and failures are verified in the real suites, without inventing a global percentage. The long-running load test is still triggered separately; the historical report is in [LOAD_TEST.md](LOAD_TEST.md).
 
-## Entrega das imagens
+## Image delivery
 
-Após **todos os jobs de CI acima passarem**, pushes para `main` e tags `v*` chamam o workflow reutilizável **Publish images**. Pull requests nunca publicam imagens nem recebem permissão de escrita no registry.
+After **all the CI jobs above pass**, pushes to `main` and `v*` tags call the reusable **Publish images** workflow. Pull requests never publish images or receive write permission on the registry.
 
-São produzidas duas imagens Linux amd64:
+Two Linux amd64 images are produced:
 
-- `ghcr.io/danielnetodotcom/jungle-wagering-processor`: runtime das APIs e workers, sem ferramentas de migration.
-- `ghcr.io/danielnetodotcom/jungle-wagering-processor-migrations`: job de migrations com suas dependências próprias.
+- `ghcr.io/danielnetodotcom/jungle-wagering-processor`: runtime for the APIs and workers, without migration tooling.
+- `ghcr.io/danielnetodotcom/jungle-wagering-processor-migrations`: migrations job with its own dependencies.
 
-As tags incluem `sha-<commit completo>`, `main`/`latest` para a branch principal e versão semântica para tags como `v1.0.0`. A saída do job registra o digest `sha256:...`, que deve ser usado para identificar exatamente um artefato. O BuildKit publica SBOM e provenance junto das imagens. Os campos OCI vinculam o pacote ao repositório e ao commit de origem.
+Tags include `sha-<full commit>`, `main`/`latest` for the main branch, and a semantic version for tags such as `v1.0.0`. The job output records the `sha256:...` digest, which should be used to identify exactly one artifact. BuildKit publishes an SBOM and provenance alongside the images. The OCI fields link the package to the source repository and commit.
 
-A autenticação usa somente o `GITHUB_TOKEN` temporário do job com `packages: write`. Nenhum PAT, senha de servidor ou credencial de produção é necessário no repositório. A visibilidade e as permissões dos pacotes GHCR são controladas pelo GitHub; publicar uma imagem não torna automaticamente seu pacote público. Esse fluxo entrega artefatos, sem configurar um destino de produção ou executar migrations em servidores externos.
+Authentication uses only the job's temporary `GITHUB_TOKEN` with `packages: write`. No PAT, server password or production credential is needed in the repository. GHCR package visibility and permissions are controlled by GitHub; publishing an image does not automatically make its package public. This flow delivers artifacts; it does not configure a production target or run migrations on external servers.
 
-## Segurança e manutenção
+## Security and maintenance
 
-**CodeQL** analisa JavaScript/TypeScript em pushes, PRs, manualmente e toda segunda-feira. Os resultados aparecem em Security and quality → Code scanning. Essa análise estática complementa os testes; não prova ausência de vulnerabilidades.
+**CodeQL** analyzes JavaScript/TypeScript on pushes, PRs, manual dispatch, and every Monday. The results appear under Security and quality → Code scanning. This static analysis complements the tests; it does not prove the absence of vulnerabilities.
 
-**Dependabot** acompanha Bun (`package.json` + `bun.lock`), Dockerfile e GitHub Actions semanalmente. MikroORM, NestJS e ESLint são agrupados para reduzir atualizações incompatíveis entre pacotes relacionados. As mudanças passam novamente pelo CI e não têm auto-merge configurado.
+**Dependabot** tracks Bun (`package.json` + `bun.lock`), the Dockerfile and GitHub Actions weekly. MikroORM, NestJS and ESLint are grouped to reduce incompatible updates across related packages. The changes go through CI again and have no auto-merge configured.
 
-`bun audit` ainda identifica dois advisories upstream sem release corrigida. Os patches locais, testes de regressão e limites estão em [AUDIT_FIXES.md](AUDIT_FIXES.md). Esses avisos não foram ocultados nem transformados em uma alegação de dependências sem vulnerabilidades.
+`bun audit` still flags two upstream advisories with no fixed release. The local patches, regression tests and limitations are in [AUDIT_FIXES.md](AUDIT_FIXES.md). These warnings were neither hidden nor turned into a claim that the dependencies are vulnerability-free.
 
-## Reprodução local
+## Local reproduction
 
 ```bash
-# Verificações e todas as suítes de testes:
+# Checks and all test suites:
 docker compose up -d postgres localstack
 docker compose --profile tools run --rm --build toolbox bun run verify
 docker compose --profile tools run --rm toolbox bun run test:e2e
 
-# Smoke do Compose: execute em ambiente descartável, pois cria wallets e transações.
+# Compose smoke test: run in a disposable environment, since it creates wallets and transactions.
 docker compose -p jungle-ci-local up -d --build --wait
 CI_BASE_URL=http://localhost:8080 bun scripts/verification/compose-smoke.ts
 docker compose -p jungle-ci-local down --volumes
 ```
 
-O smoke exige `CI_BASE_URL` explícita para evitar que uma execução sem configuração atinja silenciosamente outro serviço local. Ajuste `API_PUBLIC_PORT` e a URL se a porta 8080 estiver ocupada. Não reutilize nomes de projeto, volumes ou redes de instalações existentes.
+The smoke test requires an explicit `CI_BASE_URL` to prevent an unconfigured run from silently hitting another local service. Adjust `API_PUBLIC_PORT` and the URL if port 8080 is in use. Do not reuse project, volume or network names from existing installations.

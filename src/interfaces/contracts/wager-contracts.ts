@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { WagerTransactionKind } from '../../domain/wagering/wager-transaction-types';
+import { INTERNAL_PROVIDER_ID, WagerTransactionKind } from '../../domain/wagering/wager-transaction-types';
 
 /*
  * Wire contracts shared by HTTP and SQS. Strict objects: unknown fields are
@@ -55,7 +55,9 @@ const providerKind = z.enum([
 ]);
 
 const wagerPayloadShape = {
-  providerId: identifier(64),
+  providerId: identifier(64).refine((value) => value !== INTERNAL_PROVIDER_ID, {
+    message: `"${INTERNAL_PROVIDER_ID}" is reserved for internal transactions`,
+  }),
   externalTransactionId: identifier(128),
   playerId: identifier(128),
   walletId: canonicalUuid(),

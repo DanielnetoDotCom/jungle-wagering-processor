@@ -26,7 +26,9 @@ export interface OutboxBatchResult {
  *   3. short transaction: mark published (or persist the backoff / DEAD).
  * If the process dies between 2 and 3 the lease expires, another worker
  * claims the event again and republishes it with the same eventId: a
- * duplicate is possible, a loss is not.
+ * duplicate is possible, a loss is not. Every claim counts as an attempt, so
+ * a publication that keeps killing its worker is retained as DEAD once its
+ * attempts are exhausted instead of being republished forever.
  */
 export class PublishOutboxBatchUseCase {
   constructor(
@@ -41,16 +43,32 @@ export class PublishOutboxBatchUseCase {
 
   async execute(workerId: string): Promise<OutboxBatchResult> {
     const claimedAt = this.clock.now();
-    const claimed = await this.uow.run((scope) =>
-      scope.outbox.claimDue({
+    const maxAttempts = this.options.retry.maxAttempts;
+    const { retired, claimed } = await this.uow.run(async (scope) => {
+      const abandoned = await scope.outbox.retireAbandoned({ now: claimedAt, maxAttempts });
+      const due = await scope.outbox.claimDue({
         now: claimedAt,
         workerId,
         leaseUntil: new Date(claimedAt.getTime() + this.options.leaseMs),
         limit: this.options.batchSize,
-      }),
-    );
+      });
+      return { retired: abandoned, claimed: due };
+    });
+    for (const event of retired) {
+      this.logger.error('Outbox event retained as DEAD: attempts exhausted without a recorded outcome', {
+        eventId: event.id,
+        eventType: event.eventType,
+        aggregateId: event.aggregateId,
+        correlationId: event.correlationId,
+        attempts: event.attempts,
+        alert: 'OUTBOX_EVENT_DEAD',
+      });
+    }
+    if (retired.length > 0) {
+      this.metrics.outboxDeadLettered(retired.length);
+    }
     if (claimed.length === 0) {
-      return { claimed: 0, published: 0, failed: 0, dead: 0 };
+      return { claimed: 0, published: 0, failed: 0, dead: retired.length };
     }
     await this.faults.checkpoint('outbox.after-claim');
 
@@ -75,7 +93,7 @@ export class PublishOutboxBatchUseCase {
     }
 
     const failures = results.filter((result) => !result.ok);
-    let dead = 0;
+    let dead = retired.length;
     for (const failure of failures) {
       const event = byId.get(failure.id) as OutboxMessage;
       event.scheduleRetry(now, this.options.retry, failure.error ?? 'unknown publish error');
@@ -86,6 +104,7 @@ export class PublishOutboxBatchUseCase {
           eventId: event.id,
           eventType: event.eventType,
           aggregateId: event.aggregateId,
+          correlationId: event.correlationId,
           attempts: event.attempts,
           alert: 'OUTBOX_EVENT_DEAD',
         });
@@ -98,8 +117,8 @@ export class PublishOutboxBatchUseCase {
         claimed: claimed.length,
       });
     }
-    if (dead > 0) {
-      this.metrics.outboxDeadLettered(dead);
+    if (dead > retired.length) {
+      this.metrics.outboxDeadLettered(dead - retired.length);
     }
     return { claimed: claimed.length, published: publishedIds.length, failed: failures.length, dead };
   }
