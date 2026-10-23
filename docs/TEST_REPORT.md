@@ -9,14 +9,14 @@ Execução após correções da auditoria: **22/10/2026**, Bun 1.4.3 em containe
 | Suíte | Comando | Arquivos | Testes | Resultado | Duração |
 |---|---|---|---|---|---|
 | Unitários (domínio, contratos, hash e patches) | `bun run test:unit` | 10 | 151 | ✅ 151 pass | 0,3 s |
-| Integração (PostgreSQL + LocalStack reais) | `bun run test:integration` | 10 | 98 | ✅ 98 pass | 52,8 s |
-| Concorrência (paralelismo real, processos reais) | `bun run test:concurrency` | 4 | 12 | ✅ 12 pass | 26,5 s |
-| Falhas (SIGKILL em pontos exatos) | `bun run test:fault` | 1 | 4 | ✅ 4 pass | 20,0 s |
-| **Subtotal `bun run test`** | | **25** | **265** | ✅ **265 pass, 0 fail** | |
-| E2E (processos compilados, banco/filas próprios) | `bun run test:e2e` | 1 | 7 | ✅ 7 pass | 8,9 s |
+| Integração (PostgreSQL + LocalStack reais) | `bun run test:integration` | 10 | 99 | ✅ 99 pass | 62,0 s |
+| Concorrência (paralelismo real, processos reais) | `bun run test:concurrency` | 4 | 12 | ✅ 12 pass | 25,2 s |
+| Falhas (SIGKILL em pontos exatos) | `bun run test:fault` | 1 | 4 | ✅ 4 pass | 17,3 s |
+| **Subtotal `bun run test`** | | **25** | **266** | ✅ **266 pass, 0 fail** | |
+| E2E (processos compilados, banco/filas próprios) | `bun run test:e2e` | 1 | 7 | ✅ 7 pass | 8,1 s |
 | Carga (execução histórica, não repetida nesta correção) | `bun run test:load` | — | — | 201 wallets reconciliadas, 0 inconsistências | ver LOAD_TEST.md |
 
-Também verificados: `lint` ✅, `typecheck` ✅, `check:money` ✅ (96 arquivos), `build` ✅ (6 entrypoints compilados). **272 testes aprovados** incluindo E2E. Build Docker com lockfile congelado e patches, imagem de migration separada e smoke do Compose completo: jobs concluídos, serviços saudáveis, três APIs pelo nginx e reconciliação consistente. A verificação dos patches não elimina os dois alertas upstream que continuam aparecendo no `bun audit`; ver [AUDIT_FIXES.md](AUDIT_FIXES.md).
+Também verificados: `lint` ✅, `typecheck` ✅, `check:money` ✅ (98 arquivos), `build` ✅ (6 entrypoints compilados). **273 testes aprovados** incluindo E2E. Build Docker com lockfile congelado e patches, imagem de migration separada e smoke do Compose completo: jobs concluídos, serviços saudáveis, três APIs pelo nginx e reconciliação consistente. A verificação dos patches não elimina os dois alertas upstream que continuam aparecendo no `bun audit`; ver [AUDIT_FIXES.md](AUDIT_FIXES.md).
 
 ## Como os testes são isolados e realistas
 
