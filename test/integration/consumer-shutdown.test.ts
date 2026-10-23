@@ -2,6 +2,7 @@ import { expect, test } from 'bun:test';
 import type { Core } from '../../src/bootstrap/core';
 import { NO_FAULTS } from '../../src/application/ports/runtime.ports';
 import { RecordDeadLetterUseCase } from '../../src/application/use-cases/record-dead-letter.use-case';
+import { RecordFailedAttemptUseCase } from '../../src/application/use-cases/record-failed-attempt.use-case';
 import { WagerTransactionsConsumer } from '../../src/interfaces/consumers/wager-transactions.consumer';
 import { createTestCore } from '../support/core';
 import { TestDatabase } from '../support/database';
@@ -23,6 +24,7 @@ test('expired shutdown releases the active batch, stops heartbeats and never ack
       target.queues,
       target.processWager,
       new RecordDeadLetterUseCase(target.uow, target.clock),
+      new RecordFailedAttemptUseCase(target.uow, target.clock),
       target.metrics,
       target.logger,
       NO_FAULTS,
@@ -33,7 +35,7 @@ test('expired shutdown releases the active batch, stops heartbeats and never ack
         waitTimeSeconds: 1,
         visibilityTimeoutSeconds: 4,
         maxMessages: 10,
-        maxReceiveCount: 5,
+        maxAttempts: 5,
         retryBaseMs: 1000,
         retryMaxMs: 1000,
         shutdownTimeoutMs: 100,

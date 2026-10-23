@@ -1,5 +1,6 @@
 import 'reflect-metadata';
 import { RecordDeadLetterUseCase } from '../application/use-cases/record-dead-letter.use-case';
+import { RecordFailedAttemptUseCase } from '../application/use-cases/record-failed-attempt.use-case';
 import { createCore } from '../bootstrap/core';
 import { createNestApp } from '../bootstrap/nest/create-app';
 import { WorkerModule } from '../bootstrap/nest/modules';
@@ -15,6 +16,7 @@ void runProcess('consumer', async (config) => {
     core.queues,
     core.processWager,
     new RecordDeadLetterUseCase(core.uow, core.clock),
+    new RecordFailedAttemptUseCase(core.uow, core.clock),
     core.metrics,
     core.logger,
     new EnvFaultInjector(config.faultInjection.enabled, config.faultInjection.spec, core.logger),
@@ -25,7 +27,7 @@ void runProcess('consumer', async (config) => {
       waitTimeSeconds: config.sqs.waitTimeSeconds,
       visibilityTimeoutSeconds: config.sqs.visibilityTimeoutSeconds,
       maxMessages: config.sqs.maxMessages,
-      maxReceiveCount: config.sqs.maxReceiveCount,
+      maxAttempts: config.consumer.maxAttempts,
       retryBaseMs: config.sqs.retryBaseMs,
       retryMaxMs: config.sqs.retryMaxMs,
       shutdownTimeoutMs: config.consumer.shutdownTimeoutMs,

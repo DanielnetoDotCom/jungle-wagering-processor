@@ -23,7 +23,7 @@ describe('Crash recovery with real process deaths', () => {
 
   beforeAll(async () => {
     db = await TestDatabase.create('crash');
-    queues = await TestQueues.create('crash', { visibilityTimeoutSeconds: 3, maxReceiveCount: 5 });
+    queues = await TestQueues.create('crash', { visibilityTimeoutSeconds: 3 });
     core = await createTestCore(db, { queues: queues.names });
   });
 

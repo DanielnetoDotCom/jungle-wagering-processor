@@ -23,7 +23,11 @@ export class TestQueues {
 
   static async create(
     label: string,
-    options: { visibilityTimeoutSeconds?: number; maxReceiveCount?: number } = {},
+    options: {
+      visibilityTimeoutSeconds?: number;
+      maxReceiveCount?: number;
+      consumerMaxAttempts?: number;
+    } = {},
   ): Promise<TestQueues> {
     const suffix = `${label}-${randomBytes(4).toString('hex')}`;
     const names: TestQueueNames = {
@@ -36,7 +40,8 @@ export class TestQueues {
       queues: names,
       extra: {
         SQS_VISIBILITY_TIMEOUT_SECONDS: String(options.visibilityTimeoutSeconds ?? 30),
-        SQS_MAX_RECEIVE_COUNT: String(options.maxReceiveCount ?? 5),
+        SQS_MAX_RECEIVE_COUNT: String(options.maxReceiveCount ?? 100),
+        CONSUMER_MAX_ATTEMPTS: String(options.consumerMaxAttempts ?? 5),
       },
     });
     const sqs = new SQSClient({

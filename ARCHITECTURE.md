@@ -45,7 +45,7 @@ flowchart LR
     end
     nginx --> api1 & api2 & api3
     q --> c1 & c2 & c3
-    q -. redrive após maxReceiveCount .-> dlq
+    q -. redrive de segurança .-> dlq
     c1 & c2 & c3 -. erro permanente .-> dlq
     api1 & api2 & api3 & c1 & c2 & c3 & r1 -->|uma transação por operação| pg
     o1 & o2 -->|claim / confirm| pg
@@ -187,6 +187,7 @@ As migrations ficam em [`migrations/`](migrations/) e são versionadas e revers�
 | `wager_transactions` | `id` | operações + idempotência + snapshot do resultado + agendamento de referências |
 | `wallet_ledger_entries` | `id` | ledger append-only, uma linha por versão da wallet |
 | `inbox_messages` | `(consumer_name, message_id)` | deduplicação de mensagens |
+| `inbox_attempts` | `(consumer_name, message_id)` | tentativas reais que falharam (orçamento de retry do consumidor) |
 | `outbox_messages` | `id` (= eventId), `seq` identity | eventos a publicar |
 
 ### Constraints declarativas (migration `…0100`, `…0200`)
@@ -373,20 +374,22 @@ Nenhuma chamada de rede ao SQS acontece dentro dessa transação. Uma falha em q
 
 ### ADR-010 — SQS FIFO
 
-**Decisão.** Filas `wager-transactions.fifo` (com `RedrivePolicy` → `wager-transactions-dlq.fifo`, `maxReceiveCount=5`) e `wager-events.fifo`, criadas de forma idempotente pelo job `queue-bootstrap` (`DeduplicationScope=messageGroup`, `FifoThroughputLimit=perMessageGroupId`). O `MessageGroupId` recomendado é o `walletId`.
+**Decisão.** Filas `wager-transactions.fifo` (com `RedrivePolicy` → `wager-transactions-dlq.fifo`, `maxReceiveCount=100` como rede de segurança) e `wager-events.fifo`, criadas de forma idempotente pelo job `queue-bootstrap` (`DeduplicationScope=messageGroup`, `FifoThroughputLimit=perMessageGroupId`). O `MessageGroupId` recomendado é o `walletId`.
 
-- **Ordenação por wallet** reduz contenção e preserva a ordem do provider dentro da wallet. O consumidor processa mensagens do mesmo grupo **em sequência** e grupos diferentes **em paralelo**. Se uma mensagem do grupo falha, as seguintes do mesmo lote são adiadas para manter a ordem.
+- **Ordenação por wallet** reduz contenção e preserva a ordem do provider dentro da wallet. O consumidor processa mensagens do mesmo grupo **em sequência** e grupos diferentes **em paralelo**. Se uma mensagem do grupo falha, as seguintes do mesmo lote são adiadas para manter a ordem, sem gastar tentativas delas (ver abaixo).
 - **O banco continua sendo a garantia.** FIFO e deduplicação do SQS são **otimizações**: a deduplicação vale só por 5 minutos e por `MessageDeduplicationId`, e não protege de reentregas após o visibility timeout nem de produtores que geram ids diferentes. Os testes enviam deliberadamente a mesma mensagem com ids de deduplicação diferentes, e o inbox/idempotência mantém um único efeito.
 - **Classificação de erros no consumidor.**
 
   | Classe | Exemplo | Ação |
   |---|---|---|
   | negócio | REJECTED, conflito, wallet inexistente | registra no inbox, **ack** |
-  | transitório | `DATABASE_UNAVAILABLE`, `LOCK_TIMEOUT` | **sem ack**; `ChangeMessageVisibility` com backoff exponencial + jitter (1s → 60s); após `maxReceiveCount` o SQS move para a DLQ |
+  | transitório | `DATABASE_UNAVAILABLE`, `LOCK_TIMEOUT` | **sem ack**; falha contada em `inbox_attempts`; `ChangeMessageVisibility` com backoff exponencial + jitter (1s → 60s); após `CONSUMER_MAX_ATTEMPTS` (5) tentativas o consumidor envia para a DLQ (`PROCESSING_FAILED`, com `errorCode`) e marca `DEAD_LETTERED` no inbox |
   | permanente | JSON inválido, contrato violado (ex.: `kind: OPENING`), `messageId` reutilizado | envio **explícito** para a DLQ (com motivo nos atributos) + linha `DEAD_LETTERED` no inbox, se possível |
-  | inesperado | bug | retry até a última tentativa, depois DLQ (`PROCESSING_FAILED`) |
+  | inesperado | bug | como o transitório: retry até `CONSUMER_MAX_ATTEMPTS`, depois DLQ (`PROCESSING_FAILED`) |
 
-- **Queda do banco não esgota tentativas.** No primeiro `DATABASE_UNAVAILABLE` o consumidor **pausa o consumo** (métrica `wagering_sqs_consumer_paused = 1`) e sonda o PostgreSQL (`SELECT 1`) com backoff até 5s. Só volta a buscar mensagens quando o banco responde. Sem isso, com `maxReceiveCount=5` e backoff de 1s a 60s, uma queda de ~30s mandaria a mensagem da cabeça de cada grupo para a DLQ, e o grupo FIFO desbloqueado deixaria passar as mensagens seguintes (um REFUND, por exemplo) fora de ordem. Teste: `a database outage longer than the retry budget pauses consumption instead of dead-lettering`. Erros transitórios **por wallet** (como `LOCK_TIMEOUT`) não pausam o consumidor e seguem o redrive normal.
+- **O orçamento de tentativas é por mensagem e persistente, não o `ApproximateReceiveCount`.** Num grupo FIFO, as mensagens atrás de uma cabeça que falha voltam junto com ela a cada retry e são adiadas sem processamento: o contador de recebimentos delas sobe sem nenhuma tentativa. Com o redrive do SQS como limite, essas mensagens iriam para a DLQ sem nunca terem sido processadas. Por isso cada falha real é contada em `inbox_attempts`, numa transação curta própria (a que falhou sofreu rollback), e o consumidor decide a DLQ por esse contador. O redrive do SQS (`SQS_MAX_RECEIVE_COUNT=100`, validado como `>= CONSUMER_MAX_ATTEMPTS × SQS_MAX_MESSAGES`) fica só como rede de segurança para falhas que o consumidor não consegue contar, como uma mensagem que derruba o processo. Ao ir para a DLQ, o contador é zerado: um redrive manual recomeça com o orçamento completo. Teste: `messages behind a failing FIFO group head keep their own budget`.
+
+- **Queda do banco não esgota tentativas.** No primeiro `DATABASE_UNAVAILABLE` o consumidor **pausa o consumo** (métrica `wagering_sqs_consumer_paused = 1`) e sonda o PostgreSQL (`SELECT 1`) com backoff até 5s. Só volta a buscar mensagens quando o banco responde. Sem isso, com 5 tentativas e backoff de 1s a 60s, uma queda de ~30s mandaria a mensagem da cabeça de cada grupo para a DLQ, e o grupo FIFO desbloqueado deixaria passar as mensagens seguintes (um REFUND, por exemplo) fora de ordem. Teste: `a database outage longer than the retry budget pauses consumption instead of dead-lettering`. Durante a pausa, `DATABASE_UNAVAILABLE` não gasta tentativas. Erros transitórios **por wallet** (como `LOCK_TIMEOUT`) não pausam o consumidor e consomem o orçamento normal.
 - **Visibilidade.** O *visibility timeout* é configurável (30s). Um heartbeat estende a visibilidade a cada metade do timeout enquanto a mensagem é processada.
 - **Shutdown gracioso.** No SIGTERM o consumidor para de buscar, conclui as mensagens em andamento e devolve imediatamente (`VisibilityTimeout=0`) as recebidas e não iniciadas. **O long poll em curso não é abortado**: abortar um `ReceiveMessage` que o SQS já respondeu torna as mensagens invisíveis e consome uma de suas tentativas sem que ninguém as processe. Os testes de integração detectaram exatamente esse defeito numa versão anterior (mensagens indo para a DLQ antes da hora), e a correção reduziu de ~6s para ~1s o tempo dos testes do consumidor. O long poll termina em até `WaitTimeSeconds` (20s), dentro do `stop_grace_period` de 30s.
 
@@ -587,7 +590,7 @@ sequenceDiagram
 | Consumer morre **antes do COMMIT** | nada | mensagem invisível até o timeout | reentrega → processada uma vez | `restart under load` (SIGKILL no meio do fluxo) |
 | Consumer morre **após o COMMIT, antes do ack** | efeito + inbox confirmados | mensagem volta após o timeout | inbox → `DUPLICATE_MESSAGE` → ack | `consumer killed AFTER the commit and BEFORE the ack` |
 | `DeleteMessage` falha | confirmado | mensagem volta | igual ao anterior; métrica de falha | — (mesmo caminho do anterior) |
-| Erro transitório persistente | nada | retries com backoff; após 5 recebimentos → DLQ (redrive) | operador corrige a causa e faz redrive; inbox garante efeito único | `transient failures are retried …`, `… redriven to the DLQ after maxReceiveCount` |
+| Erro transitório persistente | `inbox_attempts`; inbox `DEAD_LETTERED` | retries com backoff; após 5 tentativas reais → DLQ pelo consumidor | operador corrige a causa e faz redrive; inbox garante efeito único | `transient failures are retried …`, `… dead-lettered after maxAttempts real attempts`, `… keep their own budget` |
 | Mensagem inválida / contrato violado | inbox `DEAD_LETTERED` (se houver `messageId`) | DLQ imediata, com motivo | correção na origem | `invalid messages go straight to the DLQ …` |
 | SIGTERM no consumer | em andamento concluídas | não iniciadas devolvidas (visibility 0) | outra instância processa | `graceful stop: in-flight work completes`, `restart under load` (SIGTERM) |
 | Outbox: morre **após o claim, antes de publicar** | `PENDING` com lease | nada publicado | lease expira → outro publisher assume | mesmo mecanismo de lease exercitado em `crash after SQS publish and before the DB confirmation: lease expires …` |
@@ -625,7 +628,7 @@ sequenceDiagram
 - **Ordenação de eventos** por wallet não é garantida entre lotes de publishers concorrentes (ADR-009); os consumidores devem usar `walletVersion`/`eventId`.
 - **Janela de deduplicação** do SQS FIFO é de 5 minutos; depois dela, duplicatas de eventos chegam aos consumidores (que devem deduplicar por `eventId`).
 - **Hot wallets** têm throughput limitado pela serialização e ocupam conexões enquanto esperam (medido em `docs/LOAD_TEST.md`).
-- **Sem retenção/arquivamento** de `inbox_messages` e `outbox_messages` publicados (crescem indefinidamente; seria um job agendado).
+- **Sem retenção/arquivamento** de `inbox_messages`, `inbox_attempts` e `outbox_messages` publicados (crescem indefinidamente; seria um job agendado).
 - **Reconciliação sob demanda**, por wallet; não há varredura agendada.
 - **Autenticação**: apenas o ponto de extensão (ADR-015).
 - **Sem OpenTelemetry/Jaeger** (ADR-013).

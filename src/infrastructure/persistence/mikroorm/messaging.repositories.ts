@@ -31,6 +31,34 @@ export class MikroOrmInboxRepository implements InboxRepository {
       this.em.persist(this.em.create(InboxMessageRecord, data));
     }
   }
+
+  async recordFailedAttempt(params: {
+    consumerName: string;
+    messageId: string;
+    errorCode: string;
+    at: Date;
+  }): Promise<number> {
+    const result = await sql<{ attempts: number }>(
+      this.em,
+      `INSERT INTO inbox_attempts AS a (consumer_name, message_id, attempts, last_error_code, last_attempt_at)
+       VALUES (?, ?, 1, ?, ?)
+       ON CONFLICT (consumer_name, message_id)
+       DO UPDATE SET attempts = a.attempts + 1,
+                     last_error_code = EXCLUDED.last_error_code,
+                     last_attempt_at = EXCLUDED.last_attempt_at
+       RETURNING a.attempts`,
+      [params.consumerName, params.messageId, params.errorCode.slice(0, 64), params.at],
+    );
+    return result.rows[0]?.attempts ?? 1;
+  }
+
+  async resetAttempts(consumerName: string, messageId: string): Promise<void> {
+    await sql(
+      this.em,
+      `UPDATE inbox_attempts SET attempts = 0 WHERE consumer_name = ? AND message_id = ? AND attempts <> 0`,
+      [consumerName, messageId],
+    );
+  }
 }
 
 export class MikroOrmOutboxRepository implements OutboxRepository {

@@ -110,7 +110,7 @@ O que acontece:
 
 1. `postgres` e `localstack` sobem e ficam *healthy*;
 2. o job `migrations` aplica as migrations (como owner do schema) e provisiona o login de runtime `wagering_service` (membro de `wagering_app`, sem `UPDATE`/`DELETE` no ledger);
-3. o job `queue-bootstrap` cria de forma idempotente `wager-transactions.fifo`, `wager-transactions-dlq.fifo` (redrive após 5 recebimentos) e `wager-events.fifo`;
+3. o job `queue-bootstrap` cria de forma idempotente `wager-transactions.fifo`, `wager-transactions-dlq.fifo` (redrive de segurança após 100 recebimentos; o consumidor envia para a DLQ antes, após 5 tentativas reais) e `wager-events.fifo`;
 4. sobem **3 `api`**, **3 `consumer`**, **2 `outbox-worker`** e **1 `reference-worker`** (cada um *healthy* via `/health/ready`);
 5. o `nginx` publica a API em `http://localhost:8080`.
 
@@ -194,6 +194,7 @@ Migrations versionadas e reversíveis em [`migrations/`](migrations/), classes M
 | `…0300IntegrityTriggers` | imutabilidade, encadeamento do ledger, ledger ↔ saldo, máquina de estados, validação de referências |
 | `…0400ApplicationRole` | papel `wagering_app` de menor privilégio |
 | `…0500FinancialIntegrity` | rejeita valores não finitos, inserções retroativas que quebram o sucessor e divergência entre a cauda do ledger e a wallet |
+| `Migration20261023000100InboxAttempts` | `inbox_attempts`: tentativas reais que falharam por mensagem (orçamento de retry do consumidor) |
 
 ```bash
 docker compose run --rm migrations                                          # up + provisionamento (feito pelo `up -d`)
@@ -436,7 +437,9 @@ Validadas na inicialização (`src/infrastructure/configuration/config.ts`): con
 | `TX_RETRY_MAX_ATTEMPTS` / `TX_RETRY_BASE_MS` / `TX_RETRY_MAX_MS` | `4` / `20` / `500` | retry de deadlock/serialização/lock timeout |
 | `AWS_REGION` / `AWS_ENDPOINT_URL` | `us-east-1` / — | SQS (LocalStack no Compose) |
 | `SQS_TRANSACTIONS_QUEUE` / `SQS_TRANSACTIONS_DLQ` / `SQS_EVENTS_QUEUE` | `wager-transactions.fifo` / `…-dlq.fifo` / `wager-events.fifo` | filas |
-| `SQS_WAIT_TIME_SECONDS` / `SQS_VISIBILITY_TIMEOUT_SECONDS` / `SQS_MAX_RECEIVE_COUNT` | `20` / `30` / `5` | long poll, visibilidade, tentativas antes da DLQ |
+| `SQS_WAIT_TIME_SECONDS` / `SQS_VISIBILITY_TIMEOUT_SECONDS` | `20` / `30` | long poll, visibilidade |
+| `CONSUMER_MAX_ATTEMPTS` | `5` | tentativas reais de processamento por mensagem antes de o consumidor enviá-la para a DLQ |
+| `SQS_MAX_RECEIVE_COUNT` | `100` | redrive do SQS, só rede de segurança; precisa ser `>= CONSUMER_MAX_ATTEMPTS × SQS_MAX_MESSAGES` |
 | `SQS_RETRY_BASE_MS` / `SQS_RETRY_MAX_MS` | `1000` / `60000` | backoff de mensagens com erro transitório |
 | `OUTBOX_BATCH_SIZE` / `OUTBOX_POLL_INTERVAL_MS` / `OUTBOX_LEASE_MS` / `OUTBOX_MAX_ATTEMPTS` | `50` / `250` / `30000` / `15` | publisher |
 | `REFERENCE_RETRY_INITIAL_MS` / `REFERENCE_RETRY_MAX_MS` / `REFERENCE_MAX_ATTEMPTS` / `REFERENCE_TTL_MS` | `2000` / `300000` / `10` / `3600000` | referências pendentes |

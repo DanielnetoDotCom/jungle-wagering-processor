@@ -13,6 +13,7 @@ import type { FaultInjector, Logger } from '../../application/ports/runtime.port
 import { wagerPayloadHash } from '../../application/services/payload-hash';
 import type { ProcessWagerTransactionUseCase } from '../../application/use-cases/process-wager-transaction.use-case';
 import type { RecordDeadLetterUseCase } from '../../application/use-cases/record-dead-letter.use-case';
+import type { RecordFailedAttemptUseCase } from '../../application/use-cases/record-failed-attempt.use-case';
 import {
   DomainError,
   InvalidTransactionStateError,
@@ -38,7 +39,11 @@ export interface ConsumerOptions {
   waitTimeSeconds: number;
   visibilityTimeoutSeconds: number;
   maxMessages: number;
-  maxReceiveCount: number;
+  /**
+   * Real processing attempts (persisted in `inbox_attempts`) before the
+   * consumer dead-letters a message. Not the SQS receive count: see the class doc.
+   */
+  maxAttempts: number;
   retryBaseMs: number;
   retryMaxMs: number;
   shutdownTimeoutMs: number;
@@ -50,8 +55,11 @@ export interface ConsumerOptions {
   isDatabaseAvailable?: () => Promise<boolean>;
 }
 
-type Outcome = 'acked' | 'retry-scheduled';
+/** Acked, or left in the queue to be received again after `retryAfterSeconds`. */
+type Outcome = 'acked' | { retryAfterSeconds: number };
 
+/** Shutdown deadline expired: the message was already released to other consumers. */
+const RELEASED: Outcome = { retryAfterSeconds: 0 };
 const SAFE_CORRELATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 /** A probe is a single `SELECT 1`: cheap enough to retry every few seconds. */
 const DATABASE_PROBE_MAX_DELAY_MS = 5_000;
@@ -66,8 +74,15 @@ const DATABASE_PROBE_MAX_DELAY_MS = 5_000;
  *  - DeleteMessage (ack) only AFTER the commit. A crash or a failed delete
  *    leads to redelivery, which the inbox turns into a no-op.
  *  - Business outcomes (REJECTED, conflicts, unknown wallet) are terminal: ack.
- *  - Transient errors: no ack, visibility set to an exponential backoff with
- *    jitter; after maxReceiveCount receives SQS redrives to the DLQ.
+ *  - Transient and unexpected errors: no ack, visibility set to an exponential
+ *    backoff with jitter. Each failure is counted in `inbox_attempts`; after
+ *    `maxAttempts` the consumer moves the message to the DLQ itself (with the
+ *    reason, and DEAD_LETTERED in the inbox).
+ *  - The budget is NOT `ApproximateReceiveCount`: the messages behind a failing
+ *    head of a FIFO group come back with it on every retry and are postponed
+ *    unprocessed, so their receive count grows without any attempt. The queue
+ *    redrive (SQS_MAX_RECEIVE_COUNT, much higher) is only a safety net for
+ *    failures the consumer cannot count, such as a message that crashes it.
  *  - Database outage: the consumer PAUSES polling until the database answers
  *    again, so an outage of any length costs at most one or two receive
  *    attempts per message instead of pushing every group head to the DLQ
@@ -95,6 +110,7 @@ export class WagerTransactionsConsumer {
     private readonly queues: QueueUrlResolver,
     private readonly processWager: ProcessWagerTransactionUseCase,
     private readonly recordDeadLetter: RecordDeadLetterUseCase,
+    private readonly recordFailedAttempt: RecordFailedAttemptUseCase,
     private readonly metrics: PrometheusMetrics,
     private readonly logger: Logger,
     private readonly faults: FaultInjector,
@@ -106,7 +122,7 @@ export class WagerTransactionsConsumer {
         baseDelayMs: options.retryBaseMs,
         maxDelayMs: options.retryMaxMs,
         jitterRatio: 0.3,
-        maxAttempts: options.maxReceiveCount,
+        maxAttempts: options.maxAttempts,
       },
       random,
     );
@@ -232,12 +248,14 @@ export class WagerTransactionsConsumer {
       const message = group[index] as Message;
       if (this.databaseDown) {
         // Do not spend this message's attempt against a database known to be down.
-        await this.postpone(queueUrl, group.slice(index), receiveCountOf(message));
+        await this.postpone(queueUrl, group.slice(index), this.retryDelaySeconds(receiveCountOf(message)));
         return;
       }
       const outcome = await this.handle(queueUrl, message);
-      if (outcome === 'retry-scheduled') {
-        await this.postpone(queueUrl, group.slice(index + 1), receiveCountOf(message));
+      if (outcome !== 'acked') {
+        // The rest of the group comes back together with the head. This receive
+        // is not an attempt for them: their budget in `inbox_attempts` is intact.
+        await this.postpone(queueUrl, group.slice(index + 1), outcome.retryAfterSeconds);
         return;
       }
     }
@@ -296,11 +314,11 @@ export class WagerTransactionsConsumer {
         inbox: { consumerName: this.options.consumerName, messageId: envelope.messageId, receiveCount },
       });
     } catch (error) {
-      if (this.abandoned) return 'retry-scheduled';
+      if (this.abandoned) return RELEASED;
       return this.onProcessingError(queueUrl, message, envelope, receiveCount, error);
     }
 
-    if (this.abandoned) return 'retry-scheduled';
+    if (this.abandoned) return RELEASED;
     if (result.type === 'MESSAGE_ID_CONFLICT') {
       return this.deadLetter(queueUrl, message, 'MESSAGE_ID_CONFLICT', undefined, undefined, undefined);
     }
@@ -326,41 +344,63 @@ export class WagerTransactionsConsumer {
     if (permanent) {
       return this.deadLetter(queueUrl, message, 'INVALID_MESSAGE', error, envelope.messageId, undefined);
     }
-    const transient = error instanceof ApplicationError && error.category === ErrorCategory.Transient;
-    if (!transient && receiveCount >= this.options.maxReceiveCount) {
-      return this.deadLetter(
-        queueUrl,
-        message,
-        'PROCESSING_FAILED',
-        error,
-        envelope.messageId,
-        safeHash(envelope),
-      );
-    }
-    if (
-      error instanceof ApplicationError &&
-      error.code === 'DATABASE_UNAVAILABLE' &&
-      this.options.isDatabaseAvailable &&
-      !this.databaseDown
-    ) {
-      this.databaseDown = true;
-      this.metrics.setConsumerPaused(true);
-      this.logger.warn('Database unavailable: pausing consumption until it recovers', {
-        consumer: this.options.consumerName,
-      });
-    }
-    const delayMs = this.backoff.delayAfterAttempt(receiveCount);
     const reason = error instanceof ApplicationError ? error.code : 'UNEXPECTED_ERROR';
+    let attempts: number | undefined;
+    if (reason === 'DATABASE_UNAVAILABLE' && this.options.isDatabaseAvailable) {
+      // An outage is not this message's fault: pause instead of spending its budget.
+      if (!this.databaseDown) {
+        this.databaseDown = true;
+        this.metrics.setConsumerPaused(true);
+        this.logger.warn('Database unavailable: pausing consumption until it recovers', {
+          consumer: this.options.consumerName,
+        });
+      }
+    } else {
+      attempts = await this.countFailedAttempt(envelope.messageId, reason);
+      if (this.abandoned) return RELEASED;
+      if (attempts !== undefined && attempts >= this.options.maxAttempts) {
+        return this.deadLetter(
+          queueUrl,
+          message,
+          'PROCESSING_FAILED',
+          error,
+          envelope.messageId,
+          safeHash(envelope),
+        );
+      }
+    }
+    const retryAfterSeconds = this.retryDelaySeconds(attempts ?? receiveCount);
     this.logger.warn('Message processing failed; will be redelivered', {
       reason,
+      attempts,
       receiveCount,
-      delayMs,
-      maxReceiveCount: this.options.maxReceiveCount,
+      retryAfterSeconds,
+      maxAttempts: this.options.maxAttempts,
       ...describeError(error),
     });
-    await this.changeVisibility(queueUrl, message, Math.ceil(delayMs / 1000));
+    await this.changeVisibility(queueUrl, message, retryAfterSeconds);
     this.metrics.sqsRetryScheduled(reason);
-    return 'retry-scheduled';
+    return { retryAfterSeconds };
+  }
+
+  /**
+   * Persists one failed attempt. When even that fails (the database is the
+   * problem) the message is simply retried: the queue redrive still bounds it.
+   */
+  private async countFailedAttempt(messageId: string, errorCode: string): Promise<number | undefined> {
+    try {
+      return await this.recordFailedAttempt.execute({
+        consumerName: this.options.consumerName,
+        messageId,
+        errorCode,
+      });
+    } catch (error) {
+      this.logger.warn(
+        'Could not record the failed attempt; retrying without counting it',
+        describeError(error),
+      );
+      return undefined;
+    }
   }
 
   private async deadLetter(
@@ -371,7 +411,7 @@ export class WagerTransactionsConsumer {
     messageId: string | undefined,
     payloadHash: string | undefined,
   ): Promise<Outcome> {
-    if (this.abandoned) return 'retry-scheduled';
+    if (this.abandoned) return RELEASED;
     const receiveCount = receiveCountOf(message);
     const errorCode = error instanceof ApplicationError || error instanceof DomainError ? error.code : reason;
     try {
@@ -397,12 +437,9 @@ export class WagerTransactionsConsumer {
     } catch (sendError) {
       // Could not move it: keep the message in the source queue (redrive policy is the safety net).
       this.logger.error('Failed to move message to the DLQ; it will be retried', describeError(sendError));
-      await this.changeVisibility(
-        queueUrl,
-        message,
-        Math.ceil(this.backoff.delayAfterAttempt(receiveCount) / 1000),
-      );
-      return 'retry-scheduled';
+      const retryAfterSeconds = this.retryDelaySeconds(receiveCount);
+      await this.changeVisibility(queueUrl, message, retryAfterSeconds);
+      return { retryAfterSeconds };
     }
 
     if (messageId) {
@@ -491,11 +528,14 @@ export class WagerTransactionsConsumer {
     await Promise.all(owned.map((message) => this.changeVisibility(queueUrl, message, 0)));
   }
 
-  private async postpone(queueUrl: string, messages: Message[], receiveCount: number): Promise<void> {
+  private async postpone(queueUrl: string, messages: Message[], seconds: number): Promise<void> {
     if (this.abandoned) return this.release(queueUrl, messages);
-    const seconds = Math.ceil(this.backoff.delayAfterAttempt(receiveCount) / 1000);
     await Promise.all(messages.map((message) => this.changeVisibility(queueUrl, message, seconds)));
     for (const message of messages) this.inFlight.delete(message);
+  }
+
+  private retryDelaySeconds(attempt: number): number {
+    return Math.ceil(this.backoff.delayAfterAttempt(attempt) / 1000);
   }
 
   /** Probes the database with exponential backoff (interruptible by stop) and resumes polling. */

@@ -9,8 +9,15 @@ const TABLES = [
   'wager_transactions',
   'wallet_ledger_entries',
   'inbox_messages',
+  'inbox_attempts',
   'outbox_messages',
 ];
+
+/** Back to the schema that predates FinancialIntegrity (later migrations are reverted first). */
+async function downToBeforeFinancialIntegrity(dbName: string): Promise<void> {
+  expect(await TestDatabase.migrate(dbName, 'down')).toEqual(['Migration20261023000100InboxAttempts']);
+  expect(await TestDatabase.migrate(dbName, 'down')).toEqual(['Migration20261022000500FinancialIntegrity']);
+}
 
 describe('Versioned, reversible migrations on a real PostgreSQL', () => {
   let db: TestDatabase;
@@ -65,7 +72,9 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
               has_table_privilege('wagering_app', 'wallet_ledger_entries', 'DELETE') AS ledger_delete,
               has_table_privilege('wagering_app', 'wager_transactions', 'DELETE') AS tx_delete,
               has_table_privilege('wagering_app', 'wallets', 'TRUNCATE') AS wallets_truncate,
-              has_table_privilege('wagering_app', 'wallets', 'UPDATE') AS wallets_update`,
+              has_table_privilege('wagering_app', 'wallets', 'UPDATE') AS wallets_update,
+              has_table_privilege('wagering_app', 'inbox_attempts', 'UPDATE') AS attempts_update,
+              has_table_privilege('wagering_app', 'inbox_attempts', 'DELETE') AS attempts_delete`,
     );
     expect(privileges).toEqual({
       ledger_insert: true,
@@ -74,13 +83,18 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
       tx_delete: false,
       wallets_truncate: false,
       wallets_update: true,
+      attempts_update: true,
+      attempts_delete: false,
     });
   });
 
   test('down reverts one step; down --all removes the whole schema; up rebuilds it', async () => {
     const reverted = await TestDatabase.migrate(db.name, 'down');
-    expect(reverted).toEqual(['Migration20261022000500FinancialIntegrity']);
+    expect(reverted).toEqual(['Migration20261023000100InboxAttempts']);
     expect(await executed()).toHaveLength(MIGRATIONS.length - 1);
+    expect(await TestDatabase.migrate(db.name, 'down')).toEqual([
+      'Migration20261022000500FinancialIntegrity',
+    ]);
     expect(await TestDatabase.migrate(db.name, 'down')).toEqual(['Migration20261022000400ApplicationRole']);
     const revoked = await db.one<{ ledger_insert: boolean }>(
       `SELECT has_table_privilege('wagering_app', 'wallet_ledger_entries', 'INSERT') AS ledger_insert`,
@@ -105,7 +119,7 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
   });
 
   test('financial integrity upgrade and rollback preserve populated wallets and ledger history', async () => {
-    await TestDatabase.migrate(db.name, 'down');
+    await downToBeforeFinancialIntegrity(db.name);
     const core = await createTestCore(db);
     try {
       for (const amount of ['0.00', '100.00']) {
@@ -127,7 +141,7 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
     expect(before).toHaveLength(3);
     await TestDatabase.migrate(db.name, 'up');
     expect(await db.query('SELECT * FROM wallet_ledger_entries ORDER BY id')).toEqual(before);
-    await TestDatabase.migrate(db.name, 'down');
+    await downToBeforeFinancialIntegrity(db.name);
     expect(await db.query('SELECT * FROM wallet_ledger_entries ORDER BY id')).toEqual(before);
     await TestDatabase.migrate(db.name, 'up');
     expect(await db.query('SELECT * FROM wallet_ledger_entries ORDER BY id')).toEqual(before);
@@ -136,7 +150,7 @@ describe('Versioned, reversible migrations on a real PostgreSQL', () => {
   test('upgrade refuses old divergent history atomically without repairing or deleting it', async () => {
     const corrupt = await TestDatabase.create('legacy_corrupt');
     try {
-      await TestDatabase.migrate(corrupt.name, 'down');
+      await downToBeforeFinancialIntegrity(corrupt.name);
       const core = await createTestCore(corrupt);
       let wallet: { id: string; playerId: string };
       try {

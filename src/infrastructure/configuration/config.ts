@@ -44,13 +44,16 @@ const environmentSchema = z.object({
   SQS_WAIT_TIME_SECONDS: int(20, 0, 20),
   SQS_VISIBILITY_TIMEOUT_SECONDS: int(30, 1, 43200),
   SQS_MAX_MESSAGES: int(10, 1, 10),
-  SQS_MAX_RECEIVE_COUNT: int(5, 1, 1000),
+  /** Queue redrive: a safety net only (e.g. a message that crashes the process). See CONSUMER_MAX_ATTEMPTS. */
+  SQS_MAX_RECEIVE_COUNT: int(100, 1, 1000),
   SQS_RETRY_BASE_MS: int(1000, 1),
   SQS_RETRY_MAX_MS: int(60000, 1),
   SQS_REQUEST_TIMEOUT_MS: int(25000, 1000),
 
   CONSUMER_NAME: z.string().min(1).default('wager-transactions-consumer'),
   CONSUMER_SHUTDOWN_TIMEOUT_MS: int(20000, 0),
+  /** Real (persisted) processing attempts of one message before the consumer dead-letters it. */
+  CONSUMER_MAX_ATTEMPTS: int(5, 1, 100),
 
   OUTBOX_BATCH_SIZE: int(50, 1, 500),
   OUTBOX_POLL_INTERVAL_MS: int(250, 10),
@@ -120,7 +123,7 @@ export interface AppConfig {
     retryMaxMs: number;
     requestTimeoutMs: number;
   };
-  consumer: { name: string; shutdownTimeoutMs: number };
+  consumer: { name: string; shutdownTimeoutMs: number; maxAttempts: number };
   outbox: {
     batchSize: number;
     pollIntervalMs: number;
@@ -176,6 +179,14 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   if (e.SQS_RETRY_MAX_MS < e.SQS_RETRY_BASE_MS || e.REFERENCE_RETRY_MAX_MS < e.REFERENCE_RETRY_INITIAL_MS) {
     throw new ConfigurationError(['retry max delays must be >= their base delays']);
   }
+  // A FIFO message is received again with every failed attempt of each message
+  // ahead of it in the same batch. Below this bound the queue redrive could
+  // dead-letter it before it was ever processed.
+  if (e.SQS_MAX_RECEIVE_COUNT < e.CONSUMER_MAX_ATTEMPTS * e.SQS_MAX_MESSAGES) {
+    throw new ConfigurationError([
+      `SQS_MAX_RECEIVE_COUNT must be >= CONSUMER_MAX_ATTEMPTS * SQS_MAX_MESSAGES (${e.CONSUMER_MAX_ATTEMPTS * e.SQS_MAX_MESSAGES})`,
+    ]);
+  }
   if (e.FAULT_INJECTION_ENABLED && e.NODE_ENV === 'production' && e.FAULT_INJECTION.trim() !== '') {
     throw new ConfigurationError(['FAULT_INJECTION cannot be enabled when NODE_ENV=production']);
   }
@@ -216,7 +227,11 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
       retryMaxMs: e.SQS_RETRY_MAX_MS,
       requestTimeoutMs: e.SQS_REQUEST_TIMEOUT_MS,
     },
-    consumer: { name: e.CONSUMER_NAME, shutdownTimeoutMs: e.CONSUMER_SHUTDOWN_TIMEOUT_MS },
+    consumer: {
+      name: e.CONSUMER_NAME,
+      shutdownTimeoutMs: e.CONSUMER_SHUTDOWN_TIMEOUT_MS,
+      maxAttempts: e.CONSUMER_MAX_ATTEMPTS,
+    },
     outbox: {
       batchSize: e.OUTBOX_BATCH_SIZE,
       pollIntervalMs: e.OUTBOX_POLL_INTERVAL_MS,

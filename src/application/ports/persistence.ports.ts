@@ -86,6 +86,15 @@ export interface LedgerRepository {
 export interface InboxRepository {
   find(consumerName: string, messageId: string): Promise<InboxMessage | undefined>;
   save(message: InboxMessage): void;
+  /** Counts one failed processing attempt (immediately, not on flush) and returns the running total. */
+  recordFailedAttempt(params: {
+    consumerName: string;
+    messageId: string;
+    errorCode: string;
+    at: Date;
+  }): Promise<number>;
+  /** Gives the message a fresh attempt budget, e.g. for an operator redrive after the DLQ. */
+  resetAttempts(consumerName: string, messageId: string): Promise<void>;
 }
 
 export interface OutboxBacklog {

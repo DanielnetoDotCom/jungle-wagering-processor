@@ -48,7 +48,7 @@ Também verificados: `lint` ✅, `typecheck` ✅, `check:money` ✅ (96 arquivos
 | Atomicidade entre wallet, ledger, inbox e outbox | `wager-processing.test.ts` → `a failure after every write but before COMMIT leaves no partial state` (HTTP e SQS); `outbox.test.ts` → `events are never visible before the financial commit` |
 | Inbox e redelivery | `sqs-consumer.test.ts` (mesma mensagem 2×, HTTP e depois SQS, `messageId` reutilizado → DLQ) e `wager-processing.test.ts` (HTTP→SQS, SQS→HTTP, `DUPLICATE_MESSAGE`) |
 | Publishers concorrentes sobre a mesma outbox | `outbox.test.ts` → `two concurrent publishers: disjoint claims (SKIP LOCKED), every event published exactly once` (60 eventos, `attempts = 1`) |
-| Retry e DLQ | `sqs-consumer.test.ts` → transitório com backoff e sucesso único; redrive para a DLQ após `maxReceiveCount`; inválidas direto para a DLQ com auditoria no inbox; queda do banco maior que o orçamento de tentativas **pausa** o consumo sem DLQ; `messageId` de 256 caracteres processado normalmente |
+| Retry e DLQ | `sqs-consumer.test.ts` → transitório com backoff e sucesso único; DLQ pelo consumidor após `maxAttempts` tentativas reais, com auditoria no inbox; mensagens atrás de uma cabeça de grupo FIFO que falha mantêm o próprio orçamento (nunca vão para a DLQ sem processamento); inválidas direto para a DLQ com auditoria no inbox; queda do banco maior que o orçamento de tentativas **pausa** o consumo sem DLQ; `messageId` de 256 caracteres processado normalmente |
 | Recuperação após reinicialização | `fault-injection/crash-recovery.test.ts` → `restart under load` e os demais crashes |
 
 ### Concorrência (paralelismo real)
@@ -94,6 +94,7 @@ A revisão inicial do núcleo financeiro encontrou cinco casos em que **operaç�
 7. **UUID em maiúsculas** era aceito pela validação, mas causava 500 por divergência de grafia. Agora é normalizado no contrato. Teste HTTP com replay em minúsculas.
 8. **Inbox `DEAD_LETTERED` sem hash** (mensagem ilegível) não podia virar `PROCESSED`, e um hash antigo podia gerar `MESSAGE_ID_CONFLICT` indevido. Agora a linha adota o payload processado. Teste de integração mais teste unitário.
 9. **Diferença de relógio entre instâncias** podia violar `updated_at >= created_at`. Agora o `Wallet` nunca data um movimento antes do anterior. Teste unitário.
+10. **Mensagens seguintes de um grupo FIFO iam para a DLQ sem processamento.** O limite de tentativas era o `ApproximateReceiveCount` (redrive do SQS). Quando a cabeça de um grupo falhava, as mensagens seguintes do mesmo lote eram recebidas e adiadas a cada retry e esgotavam o contador sem nenhuma tentativa. Agora as falhas reais são contadas em `inbox_attempts` e o consumidor decide a DLQ; o redrive do SQS virou rede de segurança. Teste: `messages behind a failing FIFO group head keep their own budget` (duas cabeças falhando; a seguinte é processada com `receive_count > maxAttempts`).
 
 Além disso, a instabilidade de uma porta TCP entregue duas vezes pelo sistema operacional ao subir 3 processos de API em paralelo, observada uma vez, foi eliminada no harness de teste (reserva de portas e nova tentativa).
 

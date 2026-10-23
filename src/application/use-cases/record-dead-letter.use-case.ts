@@ -14,7 +14,7 @@ export interface DeadLetterRecord {
  * Keeps permanent message failures auditable in the inbox (status
  * DEAD_LETTERED) next to the DLQ copy. A message already PROCESSED is never
  * touched. A later operator redrive of the same message id is processed
- * normally and turns the row into PROCESSED.
+ * normally (with its failed-attempt count reset) and turns the row into PROCESSED.
  */
 export class RecordDeadLetterUseCase {
   constructor(
@@ -39,6 +39,8 @@ export class RecordDeadLetterUseCase {
         });
       message.markDeadLettered(record.errorCode, record.receiveCount);
       scope.inbox.save(message);
+      // An operator redrive from the DLQ starts with a full retry budget.
+      await scope.inbox.resetAttempts(record.consumerName, record.messageId);
     });
   }
 }

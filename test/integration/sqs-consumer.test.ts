@@ -3,6 +3,7 @@ import { TransientInfrastructureError } from '../../src/application/errors/appli
 import type { SubmitWagerTransactionCommand } from '../../src/application/commands/wager-commands';
 import type { ProcessWagerTransactionUseCase } from '../../src/application/use-cases/process-wager-transaction.use-case';
 import { RecordDeadLetterUseCase } from '../../src/application/use-cases/record-dead-letter.use-case';
+import { RecordFailedAttemptUseCase } from '../../src/application/use-cases/record-failed-attempt.use-case';
 import type { Core } from '../../src/bootstrap/core';
 import { WagerTransactionKind as Kind } from '../../src/domain/wagering/wager-transaction-types';
 import { NO_FAULTS } from '../../src/application/ports/runtime.ports';
@@ -21,7 +22,12 @@ describe('SQS consumer (LocalStack FIFO + inbox + DLQ)', () => {
 
   beforeAll(async () => {
     db = await TestDatabase.create('consumer');
-    queues = await TestQueues.create('consumer', { visibilityTimeoutSeconds: 5, maxReceiveCount: 3 });
+    // Redrive at maxAttempts * maxMessages: only the consumer's own budget dead-letters here.
+    queues = await TestQueues.create('consumer', {
+      visibilityTimeoutSeconds: 5,
+      maxReceiveCount: 30,
+      consumerMaxAttempts: 3,
+    });
     core = await createTestCore(db, { queues: queues.names });
   });
 
@@ -45,6 +51,7 @@ describe('SQS consumer (LocalStack FIFO + inbox + DLQ)', () => {
       core.queues,
       processWager,
       new RecordDeadLetterUseCase(core.uow, core.clock),
+      new RecordFailedAttemptUseCase(core.uow, core.clock),
       core.metrics,
       core.logger,
       NO_FAULTS,
@@ -55,7 +62,7 @@ describe('SQS consumer (LocalStack FIFO + inbox + DLQ)', () => {
         waitTimeSeconds: 1,
         visibilityTimeoutSeconds: 5,
         maxMessages: 10,
-        maxReceiveCount: 3,
+        maxAttempts: 3,
         retryBaseMs: 1000,
         retryMaxMs: 1000,
         shutdownTimeoutMs: 10_000,
@@ -256,7 +263,7 @@ describe('SQS consumer (LocalStack FIFO + inbox + DLQ)', () => {
       data: payload({ walletId, playerId, kind: Kind.Bet, amount: '3.00' }),
     });
 
-    // Without the pause, maxReceiveCount=3 with 1s backoff would dead-letter it in ~3s.
+    // Without the pause, maxAttempts=3 with 1s backoff would dead-letter it in ~3s.
     await waitFor(() => Promise.resolve(failures > 0), { description: 'first failure' });
     await new Promise((resolve) => setTimeout(resolve, 8000));
     expect(failures).toBe(1);
@@ -289,26 +296,99 @@ describe('SQS consumer (LocalStack FIFO + inbox + DLQ)', () => {
     expect(event.correlation_id.length).toBeLessThanOrEqual(128);
   });
 
-  test('a message failing transiently on every attempt (e.g. lock timeouts) is redriven to the DLQ after maxReceiveCount', async () => {
+  async function attemptsOf(messageId: string) {
+    return db.query<{ attempts: number; last_error_code: string }>(
+      `SELECT attempts, last_error_code FROM inbox_attempts WHERE message_id = $1`,
+      [messageId],
+    );
+  }
+
+  test('a message failing transiently on every attempt (e.g. lock timeouts) is dead-lettered after maxAttempts real attempts', async () => {
+    let calls = 0;
     const alwaysLocked = {
-      execute: () =>
-        Promise.reject(new TransientInfrastructureError('LOCK_TIMEOUT', 'wallet is locked', 'lock_timeout')),
+      execute: () => {
+        calls += 1;
+        return Promise.reject(
+          new TransientInfrastructureError('LOCK_TIMEOUT', 'wallet is locked', 'lock_timeout'),
+        );
+      },
     } as unknown as ProcessWagerTransactionUseCase;
     startConsumer(alwaysLocked, () => Promise.resolve(true));
     const { walletId, playerId } = await openWallet();
+    const messageId = uniqueId('msg');
     await queues.sendWager({
-      messageId: uniqueId('msg'),
+      messageId,
       data: payload({ walletId, playerId, kind: Kind.Bet, amount: '1.00' }),
     });
 
     await waitFor(async () => (await queues.counts(queues.urls.transactionsDlqUrl)).visible === 1, {
       timeoutMs: 30_000,
-      description: 'redrive to DLQ by the queue policy',
+      description: 'dead-lettered by the consumer',
     });
-    expect(await queueEmpty(queues.urls.transactionsQueueUrl)).toBe(true);
-    const [redriven] = await queues.drain(queues.urls.transactionsDlqUrl);
-    expect(Number(redriven?.Attributes?.ApproximateReceiveCount ?? 0)).toBeGreaterThanOrEqual(3);
+    await waitFor(() => queueEmpty(queues.urls.transactionsQueueUrl), { description: 'source acked' });
+    expect(calls).toBe(3);
+    const [deadLetter] = await queues.drain(queues.urls.transactionsDlqUrl);
+    expect(deadLetter?.MessageAttributes?.deadLetterReason?.StringValue).toBe('PROCESSING_FAILED');
+    expect(deadLetter?.MessageAttributes?.errorCode?.StringValue).toBe('LOCK_TIMEOUT');
+    const audit = await db.one<{ status: string; result_code: string }>(
+      `SELECT status, result_code FROM inbox_messages WHERE message_id = $1`,
+      [messageId],
+    );
+    expect(audit).toEqual({ status: 'DEAD_LETTERED', result_code: 'LOCK_TIMEOUT' });
+    // Reset so that an operator redrive from the DLQ gets a full budget again.
+    expect(await attemptsOf(messageId)).toEqual([{ attempts: 0, last_error_code: 'LOCK_TIMEOUT' }]);
     expect(await transactionsOf(walletId)).toEqual([]);
+  });
+
+  test('messages behind a failing FIFO group head keep their own budget: never dead-lettered unprocessed, order kept', async () => {
+    const failingIds = [uniqueId('head-1'), uniqueId('head-2')];
+    const headsLocked = {
+      execute: (command: SubmitWagerTransactionCommand) =>
+        failingIds.includes(command.causationId ?? '')
+          ? Promise.reject(
+              new TransientInfrastructureError('LOCK_TIMEOUT', 'wallet is locked', 'lock_timeout'),
+            )
+          : core.processWager.execute(command),
+    } as unknown as ProcessWagerTransactionUseCase;
+    const { walletId, playerId } = await openWallet();
+    const followerId = uniqueId('follower');
+    // All queued before the consumer starts, so receives return them together.
+    for (const [index, messageId] of failingIds.entries()) {
+      await queues.sendWager({
+        messageId,
+        data: payload({ walletId, playerId, kind: Kind.Bet, amount: `1.0${index}` }),
+      });
+    }
+    await queues.sendWager({
+      messageId: followerId,
+      data: payload({ walletId, playerId, kind: Kind.Bet, amount: '2.00' }),
+    });
+    startConsumer(headsLocked, () => Promise.resolve(true));
+
+    await waitFor(async () => (await transactionsOf(walletId)).length === 1, {
+      timeoutMs: 45_000,
+      description: 'follower processed after both heads were dead-lettered',
+    });
+    await waitFor(() => queueEmpty(queues.urls.transactionsQueueUrl), { description: 'source acked' });
+    const deadLetters = await queues.drain(queues.urls.transactionsDlqUrl);
+    expect(deadLetters.map((message) => message.MessageAttributes?.originalMessageId?.StringValue)).toEqual(
+      failingIds,
+    );
+    const follower = await db.one<{ status: string; receive_count: number }>(
+      `SELECT status, receive_count FROM inbox_messages WHERE message_id = $1`,
+      [followerId],
+    );
+    // Received with the heads' 6 failed attempts, then processed on its first own
+    // attempt. With the receive count as the budget (3), the queue redrive would
+    // have dead-lettered it without a single attempt.
+    expect(follower.status).toBe('PROCESSED');
+    expect(follower.receive_count).toBeGreaterThan(3);
+    expect(await attemptsOf(followerId)).toEqual([]);
+    const lines = await db.query<{ amount: string }>(
+      `SELECT amount::text FROM wallet_ledger_entries WHERE wallet_id = $1 AND wallet_version > 1`,
+      [walletId],
+    );
+    expect(lines).toEqual([{ amount: '2.00' }]);
   });
 
   test('graceful stop: in-flight work completes, nothing is lost', async () => {
