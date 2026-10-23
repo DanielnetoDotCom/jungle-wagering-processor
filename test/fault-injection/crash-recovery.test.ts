@@ -106,6 +106,64 @@ describe('Crash recovery with real process deaths', () => {
     expect((await expectWalletConsistent(db, walletId)).balance).toBe('85.00');
   });
 
+  test('failed processing attempts survive a consumer process death and bound its replacement retry budget', async () => {
+    const { walletId, playerId } = await openWallet();
+    const messageId = uniqueId('persistent-budget');
+    const holder = await db.appClient();
+    const env = {
+      DB_LOCK_TIMEOUT_MS: '100',
+      TX_RETRY_MAX_ATTEMPTS: '1',
+      CONSUMER_MAX_ATTEMPTS: '3',
+      SQS_RETRY_BASE_MS: '1000',
+      SQS_RETRY_MAX_MS: '1000',
+    };
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT id FROM wallets WHERE id = $1 FOR UPDATE', [walletId]);
+      const first = await start('consumer', env);
+      await queues.sendWager({
+        messageId,
+        data: payload({ walletId, playerId, kind: Kind.Bet, amount: '1.00' }),
+      });
+      await waitFor(
+        async () => {
+          const [row] = await db.query<{ attempts: number }>(
+            'SELECT attempts FROM inbox_attempts WHERE message_id = $1',
+            [messageId],
+          );
+          return row?.attempts === 1;
+        },
+        { description: 'first real lock-timeout failure persisted' },
+      );
+      await first.kill();
+      expect(first.signalCode).toBe('SIGKILL');
+      const replacement = await start('consumer', env);
+      await waitFor(async () => (await queues.counts(queues.urls.transactionsDlqUrl)).visible === 1, {
+        description: 'replacement exhausts the persisted budget',
+      });
+      const [message] = await queues.drain(queues.urls.transactionsDlqUrl);
+      expect(message?.MessageAttributes?.originalMessageId?.StringValue).toBe(messageId);
+      expect(message?.MessageAttributes?.errorCode?.StringValue).toBe('LOCK_TIMEOUT');
+      const metrics = await (await fetch(`${replacement.url}/metrics`)).text();
+      // One failure belonged to the dead process; only two executions remain for its successor.
+      expect(metrics).toMatch(/wagering_lock_timeouts_total\{[^}]*\} 2/);
+      await waitFor(async () => {
+        const counts = await queues.counts(queues.urls.transactionsQueueUrl);
+        return counts.visible + counts.inFlight === 0;
+      });
+      expect(await db.one('SELECT attempts FROM inbox_attempts WHERE message_id = $1', [messageId])).toEqual({
+        attempts: 0,
+      });
+      expect(
+        await db.one('SELECT status, result_code FROM inbox_messages WHERE message_id = $1', [messageId]),
+      ).toEqual({ status: 'DEAD_LETTERED', result_code: 'LOCK_TIMEOUT' });
+      expect((await expectWalletConsistent(db, walletId)).balance).toBe('100.00');
+    } finally {
+      await holder.query('ROLLBACK');
+      await holder.end();
+    }
+  });
+
   test('outbox publisher killed AFTER publishing and BEFORE confirming: another instance republishes, nothing is lost', async () => {
     await queues.drain(queues.urls.eventsQueueUrl, { waitSeconds: 0 });
     const { walletId, playerId } = await openWallet();

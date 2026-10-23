@@ -121,15 +121,17 @@ export interface OutboxRepository {
     workerId: string;
     leaseUntil: Date;
     limit: number;
+    maxAttempts: number;
   }): Promise<OutboxMessage[]>;
   /**
    * Retains as DEAD the events whose attempts are exhausted and whose last
    * claim was abandoned (lease expired without a recorded outcome), so a
    * publication that keeps killing its worker is not republished forever.
+   * Uses a bounded SKIP LOCKED batch so unrelated events remain publishable.
    * An event requeued by an operator has no lease and gets a new attempt.
    */
-  retireAbandoned(params: { now: Date; maxAttempts: number }): Promise<RetiredOutboxEvent[]>;
-  /** Marks events as published. Idempotent; does not require the lease (publication already happened). */
+  retireAbandoned(params: { now: Date; maxAttempts: number; limit: number }): Promise<RetiredOutboxEvent[]>;
+  /** Confirms delivery, including after retirement. Idempotent; publication already happened. */
   markPublished(ids: readonly string[], at: Date): Promise<number>;
   /** Persists a retry/dead decision, only if `workerId` still owns the lease. */
   saveRetry(message: OutboxMessage, workerId: string): Promise<boolean>;

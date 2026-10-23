@@ -1,6 +1,6 @@
 # Test report
 
-Last run: **2026-10-23**, after the requirements-conformance audit (defects 11–16 below), Bun 1.4.3 in the `toolbox` container, real PostgreSQL 17 and LocalStack 4.14. Every suite creates its own databases and queues. The Compose stack was then rebuilt with `docker compose up -d --build` (all pending migrations applied to its existing data) and checked end to end with `scripts/verification/compose-smoke.ts` and `bun run demo`. To reproduce with the repository's Compose file: `docker compose --profile tools run --rm --build toolbox bun run verify`. Details of the fixes, isolation and limitations are in [AUDIT_FIXES.md](AUDIT_FIXES.md).
+Last run: **2026-10-23**, after the independent review (IR-01–IR-03 in [AUDIT_FIXES.md](AUDIT_FIXES.md#independent-review-of-the-2026-10-23-fixes)), Bun 1.4.3 in the `toolbox` container, real PostgreSQL **17.11** and LocalStack image **4.14.0**. Every suite creates its own databases and queues. Both commands exited 0: `docker compose --profile tools run --rm --build toolbox bun run verify` and `docker compose --profile tools run --rm toolbox bun run test:e2e`. Existing application services were not rebuilt or restarted in this review. The Compose/nginx smoke checks, demo, dependency audit and load results described elsewhere in this report are historical and were not repeated for this review. Details of causes, failing reproductions, fixes, requirement coverage and limits are in [AUDIT_FIXES.md](AUDIT_FIXES.md#independent-review-of-the-2026-10-23-fixes).
 
 `bun run verify` runs, in order and failing on the first error: **ESLint** (`--max-warnings=0`, type-checked rules and layer boundaries) → **Prettier** (`--check`) → **typecheck** (`tsc --noEmit`, strict mode) → **`check:money`** → **build** (`tsc`) → **tests**.
 
@@ -8,15 +8,15 @@ Last run: **2026-10-23**, after the requirements-conformance audit (defects 11�
 
 | Suite | Command | Files | Tests | Result | Duration |
 |---|---|---|---|---|---|
-| Unit (domain, application, contracts, config, hash and patches) | `bun run test:unit` | 12 | 160 | ✅ 160 pass | 0.2 s |
-| Integration (real PostgreSQL + LocalStack) | `bun run test:integration` | 10 | 104 | ✅ 104 pass | 60.1 s |
-| Concurrency (real parallelism, real processes) | `bun run test:concurrency` | 4 | 12 | ✅ 12 pass | 19.5 s |
-| Fault injection (SIGKILL at exact points) | `bun run test:fault` | 1 | 4 | ✅ 4 pass | 17.8 s |
-| **`bun run test` subtotal** | | **27** | **280** | ✅ **280 pass, 0 fail** | |
-| E2E (compiled processes, dedicated database/queues) | `bun run test:e2e` | 1 | 7 | ✅ 7 pass | 6.5 s |
+| Unit (domain, application, contracts, config, hash, fixtures and patches) | `bun run test:unit` | 13 | 161 | ✅ 161 pass | 0.36 s |
+| Integration (real PostgreSQL + LocalStack) | `bun run test:integration` | 10 | 110 | ✅ 110 pass | 66.63 s |
+| Concurrency (real parallelism, real processes) | `bun run test:concurrency` | 4 | 12 | ✅ 12 pass | 20.47 s |
+| Fault injection (SIGKILL at exact points) | `bun run test:fault` | 1 | 5 | ✅ 5 pass | 27.62 s |
+| **`bun run test` subtotal** | | **28** | **288** | ✅ **288 pass, 0 fail** | |
+| E2E (compiled processes, dedicated database/queues) | `bun run test:e2e` | 1 | 7 | ✅ 7 pass | 6.82 s |
 | Load (historical run, not repeated for this fix) | `bun run test:load` | — | — | 201 wallets reconciled, 0 inconsistencies | see LOAD_TEST.md |
 
-Also verified: `lint` ✅, `typecheck` ✅, `check:money` ✅ (99 files), `build` ✅ (6 compiled entrypoints). **287 tests passed** including E2E. Docker build with frozen lockfile and patches, separate migration image, and full Compose smoke test: jobs completed, services healthy, three APIs behind nginx, and consistent reconciliation. Verifying the patches does not eliminate the two upstream alerts that still show up in `bun audit`; see [AUDIT_FIXES.md](AUDIT_FIXES.md).
+Also verified in this run: `lint` ✅ (ESLint without warnings and Prettier), `typecheck` ✅, `check:money` ✅ (99 files), `build` ✅ (6 compiled entrypoints). **295 tests passed** including E2E. The toolbox Docker build used the frozen lockfile and existing patches. Earlier separate migration-image and full Compose smoke checks, and the two then-visible upstream `bun audit` alerts, are historical evidence; see [AUDIT_FIXES.md](AUDIT_FIXES.md).
 
 ## How the tests are isolated and realistic
 
@@ -44,7 +44,7 @@ Also verified: `lint` ✅, `typecheck` ✅, `check:money` ✅ (99 files), `build
 
 | Requirement | Where |
 |---|---|
-| Migrations and constraints | `migrations.test.ts` (up, one-step down, full down, up again, no-op, grants) and `schema-guarantees.test.ts` (20 direct SQL attacks: uniqueness, negative balance, version, append-only ledger for owner **and** runtime, arithmetic, chain, direction × type, ledger line tied to its transaction with the exact amount, PROCESSED transaction without ledger, immutable terminal state, idempotency keys, single reversal, reference validation, internal OPENING, immutable inbox and outbox) |
+| Migrations and constraints | `migrations.test.ts` (up, one-step down, full down, up again, no-op, grants) and `schema-guarantees.test.ts` (21 direct SQL tests: uniqueness, negative balance, version, append-only ledger for owner **and** runtime, arithmetic, chain, direction × type, ledger line tied to its transaction with the exact amount, PROCESSED transaction without ledger, immutable terminal state, idempotency keys, single reversal, reference validation, internal OPENING/provider, immutable inbox and outbox) |
 | Atomicity across wallet, ledger, inbox and outbox | `wager-processing.test.ts` → `a failure after every write but before COMMIT leaves no partial state` (HTTP and SQS); `outbox.test.ts` → `events are never visible before the financial commit` |
 | Inbox and redelivery | `sqs-consumer.test.ts` (same message 2×, HTTP then SQS, reused `messageId` → DLQ) and `wager-processing.test.ts` (HTTP→SQS, SQS→HTTP, `DUPLICATE_MESSAGE`) |
 | Concurrent publishers on the same outbox | `outbox.test.ts` → `two concurrent publishers: disjoint claims (SKIP LOCKED), every event published exactly once` (60 events, `attempts = 1`) |
@@ -61,12 +61,12 @@ Also verified: `lint` ✅, `typecheck` ✅, `check:money` ✅ (99 files), `build
 | 4 | ≥ 3 processes/instances | the tests above and `hot wallet: 300 concurrent operations from 3 APIs + 3 consumers` | no spurious rejections; exact balance; lock contention observed in the metrics |
 | 5 | Worker killed **after the commit and before the ack** | `crash-recovery.test.ts` → `consumer killed AFTER the commit and BEFORE the ack` | process killed with SIGKILL; inbox `PROCESSED`; message not deleted; a new consumer absorbs it (`inbox_duplicates = 1`); a single DEBIT |
 | 6 | Two publishers on the same outbox | `outbox.test.ts` (in-process) and `crash-recovery.test.ts` → `outbox publisher killed AFTER publishing and BEFORE confirming` (real processes) | disjoint claims; after the crash, the lease expires and another publisher republishes (`attempts = 2`); all eventIds delivered |
-| 7 | ROLLBACK/REFUND before the reference | `pending-references.test.ts` (5) and E2E | 202 → resolved when the BET arrives; backoff 2s/4s/8s/16s; `REFERENCE_NOT_FOUND` when exhausted; ROLLBACK→REFUND→BET cascade; 8 concurrent REFUNDs → 1 applied |
+| 7 | ROLLBACK/REFUND before the reference | `pending-references.test.ts` (6) and E2E | 202 → resolved when the BET arrives; backoff 2s/4s/8s/16s; `REFERENCE_NOT_FOUND` when attempts or the default TTL expire, including rejection delivery to SQS; ROLLBACK→REFUND→BET cascade; 8 concurrent REFUNDs → 1 applied |
 | 8 | Service restart with eventual consistency | `crash-recovery.test.ts` → `restart under load: consumers SIGKILLed and SIGTERMed mid-stream` | 60 operations (with REFUND before BET) all `PROCESSED` once; 20 wallets with balance 102.50; empty DLQ |
 
 Extras: a deterministically provoked deadlock, with PostgreSQL choosing the victim (`a provoked deadlock is detected by PostgreSQL, retried from scratch and applied exactly once`); `lock_timeout` with a retryable `503` error and nothing persisted; measured contention; **PostgreSQL actually unavailable** (`ALLOW_CONNECTIONS false` + terminated connections) → `503 DATABASE_UNAVAILABLE`, readiness 503, liveness 200 and automatic recovery.
 
-### HTTP API (`http-api.test.ts`, 19 tests)
+### HTTP API (`http-api.test.ts`, 20 tests)
 
 Contracts and status codes for every endpoint: uppercase UUIDs treated as the same wallet and the same operation, `201` + `Location`, `200` replay with an identical body and `Idempotent-Replayed`, `202` pending, `400` (payload, malformed JSON, missing `Idempotency-Key`, OPENING, unknown field, invalid amount, invalid cursor, `limit` > 200), `404`, `409`, `422` (with `failureCode`, `transactionId`, observed balance), `503`, `X-Correlation-Id` propagation, end-to-end keyset pagination (asc/desc), reconciliation, health and `/metrics`.
 
@@ -110,6 +110,12 @@ Each fix started with a test that reproduced the defect and failed.
 New coverage without a defect behind it: replayed `422` and `202` status codes, reference mismatches on provider/wallet/currency, ROLLBACK of a ROLLBACK, `rehydrate` of transactions and ledger entries, the replay-or-conflict decision as a unit test, the configuration guard on the SQS redrive, and the outbox lag, processing duration, replay and DLQ metrics.
 
 In addition, a flaky failure caused by the operating system handing out the same TCP port twice when starting 3 API processes in parallel, observed once, was eliminated in the test harness (port reservation and retry).
+
+### Independent review (2026-10-23)
+
+Three further P2 defects were reproduced with failing tests and fixed: a locked abandoned outbox row blocked unrelated publishers; successful late confirmation left delivered events DEAD; reconciliation alerts exposed exact balances. Retirement now uses bounded SKIP LOCKED batches with an independent claim-budget predicate, confirmation accepts known delivery after retirement, and alerts contain safe diagnostics. See [IR-01–IR-03](AUDIT_FIXES.md#additional-defects-reproduced-and-fixed) for files, causes, RED/GREEN evidence and remaining limits.
+
+Additional coverage proves exhausted backlogs never get an extra claim, operator requeue preserves attempt history, default TTL rejection reaches real SQS, persisted consumer failures survive SIGKILL, null results keep polling, and an injected scoped identity can read its own transaction while foreign/missing ids return 404. No dependency or applied migration was changed; no integration/concurrency test was weakened or disabled.
 
 ## What was not validated here
 

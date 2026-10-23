@@ -1,7 +1,10 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import pino from 'pino';
 import { ResourceNotFoundError } from '../../src/application/errors/application-errors';
+import { ReconcileWalletUseCase } from '../../src/application/use-cases/reconcile-wallet.use-case';
 import type { Core } from '../../src/bootstrap/core';
 import { WagerTransactionKind as Kind } from '../../src/domain/wagering/wager-transaction-types';
+import { PinoLogger } from '../../src/infrastructure/logging/logger';
 import { expectAllWalletsConsistent } from '../support/consistency';
 import { createTestCore } from '../support/core';
 import { TestDatabase } from '../support/database';
@@ -106,6 +109,25 @@ describe('Reconciliation: materialized balance vs immutable ledger', () => {
     const report = await core.reconcileWallet.execute(walletId);
     expect(report.checks).toEqual({ balanceMatches: true, versionMatches: true, chainIntact: false });
     expect(report.consistent).toBe(false);
+  });
+
+  test('divergence logs identify the failed checks without exposing wallet balances', async () => {
+    const { walletId } = await walletWithHistory();
+    await tamper('UPDATE wallets SET balance_amount = balance_amount + 0.01 WHERE id = $1', [walletId]);
+    let output = '';
+    const logger = new PinoLogger(pino({ level: 'info' }, { write: (line) => (output += line) }));
+    const reconcile = new ReconcileWalletUseCase(core.uow, core.clock, core.metrics, logger);
+    const report = await reconcile.execute(walletId);
+    expect(report.consistent).toBe(false);
+    expect(report.storedBalance.amount).toBe('76.69');
+    expect(report.calculatedBalance.amount).toBe('76.68');
+    expect(report.difference.amount).toBe('0.01');
+    expect(JSON.parse(output)).toMatchObject({
+      walletId,
+      checks: { balanceMatches: false, versionMatches: true, chainIntact: true },
+      alert: 'RECONCILIATION_DIVERGENCE',
+    });
+    for (const amount of ['76.69', '76.68', '0.01']) expect(output).not.toContain(amount);
   });
 
   test('concurrent movements never produce a false divergence (single REPEATABLE READ snapshot)', async () => {

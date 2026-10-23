@@ -74,9 +74,9 @@ export class ReconcileWalletUseCase {
     } else {
       this.logger.error('Wallet reconciliation found a divergence', {
         walletId,
-        storedBalance: report.storedBalance.amount,
-        calculatedBalance: report.calculatedBalance.amount,
-        difference: report.difference.amount,
+        checkedEntries: report.checkedEntries,
+        walletVersion: report.walletVersion,
+        lastLedgerVersion: report.lastLedgerVersion,
         checks: report.checks,
         alert: 'RECONCILIATION_DIVERGENCE',
       });

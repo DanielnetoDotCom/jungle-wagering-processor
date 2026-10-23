@@ -10,7 +10,7 @@ import { SqsEventPublisher } from '../../src/infrastructure/messaging/sqs/sqs-ev
 import { expectAllWalletsConsistent } from '../support/consistency';
 import { createTestCore } from '../support/core';
 import { TestDatabase } from '../support/database';
-import { httpCommand, ManualClock, payload, ScriptedFaults, uniqueId } from '../support/fixtures';
+import { httpCommand, Latch, ManualClock, payload, ScriptedFaults, uniqueId } from '../support/fixtures';
 import { TestQueues } from '../support/sqs';
 
 /** Publisher double that fails on demand, then delegates to the real SQS publisher. */
@@ -161,6 +161,45 @@ describe('Transactional outbox -> SQS (LocalStack)', () => {
     expect(attempts).toEqual({ max: 1, published: 60 });
   });
 
+  test('a locked exhausted event does not block retirement or publication of unrelated events', async () => {
+    await produceEvents(1);
+    const ids = await pendingIds();
+    const lockedId = ids[0];
+    await db.query(
+      `UPDATE outbox_messages SET attempts = 3, claimed_by = 'abandoned', claim_expires_at = $2 WHERE id = $1`,
+      [lockedId, new Date(clock.now().getTime() - 1)],
+    );
+    const publisher = await createTestCore(db, {
+      queues: queues.names,
+      overrides: { clock },
+      env: { DB_LOCK_TIMEOUT_MS: '100', OUTBOX_MAX_ATTEMPTS: '3' },
+    });
+    const holder = await db.appClient();
+    try {
+      await holder.query('BEGIN');
+      await holder.query('SELECT id FROM outbox_messages WHERE id = $1 FOR UPDATE', [lockedId]);
+      await expect(publisher.publishOutbox.execute('unblocked')).resolves.toMatchObject({
+        claimed: 3,
+        published: 3,
+        dead: 0,
+      });
+      expect(eventIdsOf(await queues.drain(queues.urls.eventsQueueUrl)).sort()).toEqual(ids.slice(1).sort());
+      await holder.query('ROLLBACK');
+      await expect(publisher.publishOutbox.execute('retire-unlocked')).resolves.toMatchObject({
+        claimed: 0,
+        dead: 1,
+      });
+      expect(await db.one('SELECT status, attempts FROM outbox_messages WHERE id = $1', [lockedId])).toEqual({
+        status: 'DEAD',
+        attempts: 3,
+      });
+    } finally {
+      await holder.query('ROLLBACK');
+      await holder.end();
+      await publisher.close();
+    }
+  });
+
   test('broker failure: backoff persisted, event retried later and never lost; DEAD after max attempts', async () => {
     const failing = await createTestCore(db, {
       queues: queues.names,
@@ -302,6 +341,85 @@ describe('Transactional outbox -> SQS (LocalStack)', () => {
     // Retained for an operator, never republished again on its own.
     clock.advance(30_001);
     expect((await publisherB.publishOutbox.execute('worker-b')).claimed).toBe(0);
+  });
+
+  test('an exhausted backlog larger than a retirement batch is never claimed again', async () => {
+    await produceEvents(2);
+    const ids = await pendingIds();
+    expect(ids).toHaveLength(8); // publishers retire at most seven rows per batch
+    await db.query(
+      `UPDATE outbox_messages SET attempts = 3, claimed_by = 'abandoned', claim_expires_at = $2
+        WHERE id = ANY($1::uuid[])`,
+      [ids, new Date(clock.now().getTime() - 1)],
+    );
+    expect(await publisherA.publishOutbox.execute('retire-a')).toMatchObject({
+      claimed: 0,
+      published: 0,
+      dead: 7,
+    });
+    expect(await publisherB.publishOutbox.execute('retire-b')).toMatchObject({ claimed: 0, dead: 1 });
+    expect(
+      await db.query('SELECT DISTINCT status, attempts FROM outbox_messages WHERE id = ANY($1::uuid[])', [
+        ids,
+      ]),
+    ).toEqual([{ status: 'DEAD', attempts: 3 }]);
+    expect(await queues.drain(queues.urls.eventsQueueUrl, { waitSeconds: 0 })).toEqual([]);
+  });
+
+  test('a successful publication confirmed after retirement is recorded as PUBLISHED', async () => {
+    await produceEvents(1);
+    const ids = await pendingIds();
+    const confirmation = new Latch();
+    const slow = await createTestCore(db, {
+      queues: queues.names,
+      overrides: { clock, faults },
+      env: { OUTBOX_MAX_ATTEMPTS: '1' },
+    });
+    const retiring = await createTestCore(db, {
+      queues: queues.names,
+      overrides: { clock },
+      env: { OUTBOX_MAX_ATTEMPTS: '1' },
+    });
+    faults.on('outbox.after-publish-before-confirm', () => confirmation.wait());
+    const publication = slow.publishOutbox.execute('slow-success');
+    try {
+      await confirmation.reached;
+      clock.advance(30_001);
+      expect(await retiring.publishOutbox.execute('retiring')).toMatchObject({ claimed: 0, dead: 4 });
+      confirmation.open();
+      expect(await publication).toMatchObject({ published: 4 });
+      expect(eventIdsOf(await queues.drain(queues.urls.eventsQueueUrl)).sort()).toEqual(ids.sort());
+      expect(
+        await db.query('SELECT DISTINCT status, attempts FROM outbox_messages WHERE id = ANY($1::uuid[])', [
+          ids,
+        ]),
+      ).toEqual([{ status: 'PUBLISHED', attempts: 1 }]);
+    } finally {
+      confirmation.open();
+      await publication;
+      faults.clear();
+      await Promise.all([slow.close(), retiring.close()]);
+    }
+  });
+
+  test('an operator can requeue DEAD events without decreasing their immutable attempt history', async () => {
+    await produceEvents(1);
+    const ids = await pendingIds();
+    await db.query(`UPDATE outbox_messages SET attempts = 3, status = 'DEAD' WHERE id = ANY($1::uuid[])`, [
+      ids,
+    ]);
+    await db.query(`UPDATE outbox_messages SET status = 'PENDING' WHERE id = ANY($1::uuid[])`, [ids]);
+    expect(await publisherA.publishOutbox.execute('operator-redrive')).toMatchObject({
+      claimed: 4,
+      published: 4,
+      dead: 0,
+    });
+    expect(eventIdsOf(await queues.drain(queues.urls.eventsQueueUrl)).sort()).toEqual(ids.sort());
+    expect(
+      await db.query('SELECT DISTINCT status, attempts FROM outbox_messages WHERE id = ANY($1::uuid[])', [
+        ids,
+      ]),
+    ).toEqual([{ status: 'PUBLISHED', attempts: 4 }]);
   });
 
   test('outbox lag gauge: age of the oldest unpublished event, back to zero once published', async () => {

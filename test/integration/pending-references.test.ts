@@ -8,6 +8,7 @@ import { expectAllWalletsConsistent, expectWalletConsistent } from '../support/c
 import { createTestCore } from '../support/core';
 import { TestDatabase } from '../support/database';
 import { httpCommand, ManualClock, payload, uniqueId } from '../support/fixtures';
+import { TestQueues } from '../support/sqs';
 
 /**
  * Out-of-order delivery: REFUND/ROLLBACK before their reference. Time is a
@@ -155,6 +156,56 @@ describe('Pending references (out-of-order operations)', () => {
       'WagerTransactionRejected',
     ]);
     await expectWalletConsistent(db, walletId);
+  });
+
+  test('the default TTL rejects a missing reference before the attempt cap and publishes the rejection', async () => {
+    const queues = await TestQueues.create('reference_ttl');
+    const ttlClock = new ManualClock(clock.now());
+    const target = await createTestCore(db, { queues: queues.names, overrides: { clock: ttlClock } });
+    try {
+      const { walletId, playerId } = await openWallet('10.00');
+      const externalId = uniqueId('ttl-refund');
+      const accepted = await target.processWager.execute(
+        httpCommand(
+          payload({
+            walletId,
+            playerId,
+            kind: Kind.Refund,
+            amount: '1.00',
+            externalTransactionId: externalId,
+            reference: uniqueId('never-arriving'),
+          }),
+        ),
+      );
+      expect(accepted.type).toBe('RECORDED');
+      const expiresAt = ttlClock.now().getTime() + target.config.reference.ttlMs;
+      for (let attempt = 0; attempt < target.config.reference.maxAttempts; attempt += 1) {
+        const row = await transaction(externalId);
+        if (row.status !== 'PENDING_REFERENCE') break;
+        ttlClock.set(row.next_attempt_at as Date);
+        await runWorkerOnce(target, 'ttl-worker');
+      }
+      const row = await transaction(externalId);
+      expect(row).toMatchObject({ status: 'REJECTED', failure_code: 'REFERENCE_NOT_FOUND' });
+      expect(row.reference_attempts).toBeLessThan(target.config.reference.maxAttempts);
+      expect(ttlClock.now().getTime()).toBeGreaterThanOrEqual(expiresAt);
+      expect(ttlClock.now().getTime() - expiresAt).toBeLessThan(target.config.reference.maxDelayMs);
+      for (;;) {
+        const batch = await target.publishOutbox.execute('ttl-publisher');
+        if (batch.claimed === 0) break;
+      }
+      const events = (await queues.drain(queues.urls.eventsQueueUrl)).map(
+        (message) => JSON.parse(message.Body ?? '{}') as { aggregateId: string; eventType: string },
+      );
+      expect(events.filter((event) => event.aggregateId === row.id).map((event) => event.eventType)).toEqual([
+        'WagerTransactionPendingReference',
+        'WagerTransactionRejected',
+      ]);
+      expect((await expectWalletConsistent(db, walletId)).balance).toBe('10.00');
+    } finally {
+      await target.close();
+      await queues.destroy();
+    }
   });
 
   test('competing worker instances on the same due transaction produce exactly one effect', async () => {

@@ -421,6 +421,18 @@ describe('REST API (Nest + Express, real PostgreSQL and SQS)', () => {
           status: 404,
           body: { code: 'TRANSACTION_NOT_FOUND' },
         });
+        expect(
+          await scopedCall('GET', '/wagering/transactions/00000000-0000-4000-8000-000000000000'),
+        ).toMatchObject({ status: 404, body: { code: 'TRANSACTION_NOT_FOUND' } });
+        const owned = await scopedCall('POST', '/wagering/transactions', {
+          ...bet,
+          providerId: 'provider-b',
+          externalTransactionId: uniqueId('owned'),
+        });
+        expect(owned.status).toBe(201);
+        expect(
+          await scopedCall('GET', `/wagering/transactions/${String(owned.body.transactionId)}`),
+        ).toMatchObject({ status: 200, body: { providerId: 'provider-b', status: 'PROCESSED' } });
       } finally {
         await scoped.close();
       }

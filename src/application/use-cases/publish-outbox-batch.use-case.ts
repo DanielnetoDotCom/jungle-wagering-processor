@@ -45,12 +45,17 @@ export class PublishOutboxBatchUseCase {
     const claimedAt = this.clock.now();
     const maxAttempts = this.options.retry.maxAttempts;
     const { retired, claimed } = await this.uow.run(async (scope) => {
-      const abandoned = await scope.outbox.retireAbandoned({ now: claimedAt, maxAttempts });
+      const abandoned = await scope.outbox.retireAbandoned({
+        now: claimedAt,
+        maxAttempts,
+        limit: this.options.batchSize,
+      });
       const due = await scope.outbox.claimDue({
         now: claimedAt,
         workerId,
         leaseUntil: new Date(claimedAt.getTime() + this.options.leaseMs),
         limit: this.options.batchSize,
+        maxAttempts,
       });
       return { retired: abandoned, claimed: due };
     });

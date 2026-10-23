@@ -79,6 +79,7 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
     workerId: string;
     leaseUntil: Date;
     limit: number;
+    maxAttempts: number;
   }): Promise<OutboxMessage[]> {
     const claimed = await sql<{ id: string; seq: string }>(
       this.em,
@@ -88,6 +89,7 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
           WHERE status = 'PENDING'
             AND next_attempt_at <= ?
             AND (claim_expires_at IS NULL OR claim_expires_at < ?)
+            AND (attempts < ? OR claim_expires_at IS NULL)
           ORDER BY seq
           LIMIT ?
           FOR UPDATE SKIP LOCKED
@@ -97,7 +99,7 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
          FROM due
         WHERE o.id = due.id
        RETURNING o.id, o.seq::text AS seq`,
-      [params.now, params.now, params.limit, params.workerId, params.leaseUntil],
+      [params.now, params.now, params.maxAttempts, params.limit, params.workerId, params.leaseUntil],
     );
     if (claimed.rows.length === 0) {
       return [];
@@ -117,17 +119,29 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
       .map(toOutboxMessage);
   }
 
-  async retireAbandoned(params: { now: Date; maxAttempts: number }): Promise<RetiredOutboxEvent[]> {
+  async retireAbandoned(params: {
+    now: Date;
+    maxAttempts: number;
+    limit: number;
+  }): Promise<RetiredOutboxEvent[]> {
     const retired = await sql<RetiredRow>(
       this.em,
-      `UPDATE outbox_messages
+      `WITH abandoned AS (
+         SELECT id FROM outbox_messages
+          WHERE status = 'PENDING'
+            AND attempts >= ?
+            AND claim_expires_at < ?
+          ORDER BY seq
+          LIMIT ?
+          FOR UPDATE SKIP LOCKED
+       )
+       UPDATE outbox_messages o
           SET status = 'DEAD', claimed_by = NULL, claim_expires_at = NULL,
               last_error = 'abandoned: no outcome recorded after the last attempt'
-        WHERE status = 'PENDING'
-          AND attempts >= ?
-          AND claim_expires_at < ?
-       RETURNING id, event_type, aggregate_id, correlation_id, attempts`,
-      [params.maxAttempts, params.now],
+         FROM abandoned
+        WHERE o.id = abandoned.id
+       RETURNING o.id, o.event_type, o.aggregate_id, o.correlation_id, o.attempts`,
+      [params.maxAttempts, params.now, params.limit],
     );
     return retiredEvents(retired.rows);
   }
@@ -139,7 +153,7 @@ export class MikroOrmOutboxRepository implements OutboxRepository {
       `UPDATE outbox_messages
           SET status = 'PUBLISHED', published_at = ?, claimed_by = NULL, claim_expires_at = NULL, last_error = NULL
         WHERE id = ANY(?::uuid[])
-          AND status = 'PENDING'`,
+          AND status IN ('PENDING', 'DEAD')`,
       [at, [...ids]],
     );
     return result.rowCount;
